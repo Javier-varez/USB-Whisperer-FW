@@ -13,5 +13,5 @@ rustflags = [
 ]
 
 [alias]
-rb = "run --bin"
-rrb = "run --release --bin"
+r = "run"
+rr = "run --release"
