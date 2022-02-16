@@ -1,5 +1,5 @@
 [build]
-target = "thumbv7em-none-eabi"
+target = "thumbv7em-none-eabihf"
 
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
 runner = "probe-run --chip nrf52840_xxAA"
