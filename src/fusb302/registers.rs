@@ -28,7 +28,15 @@ pub mod switches1 {
 
 pub mod mask {
     pub const ADDR: u8 = 0x0A;
-    pub const MASK_BC_LVL: u8 = 0x01;
+    pub const MASK_BC_LVL: u8 = 1 << 0;
+}
+
+pub mod maska {
+    pub const ADDR: u8 = 0x0E;
+}
+
+pub mod maskb {
+    pub const ADDR: u8 = 0x0F;
 }
 
 pub mod control0 {

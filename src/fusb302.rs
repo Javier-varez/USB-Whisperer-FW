@@ -83,8 +83,16 @@ impl<T: Read + Write> Fusb302<T> {
 
         self.auto_goodcrc_enable(false)?;
 
+        self.mask_all_interrutps()?;
+
         // Enable power
         self.write_register(registers::power::ADDR, registers::power::PWR_ALL_MASK)
+    }
+
+    fn mask_all_interrutps(&mut self) -> Result<(), Error<T>> {
+        self.write_register(registers::mask::ADDR, 0xff)?;
+        self.write_register(registers::maska::ADDR, 0xff)?;
+        self.write_register(registers::maskb::ADDR, 0xff)
     }
 
     pub fn reset_pd(&mut self) -> Result<(), Error<T>> {
@@ -96,6 +104,11 @@ impl<T: Read + Write> Fusb302<T> {
             reg & !registers::control2::TOGGLE
         })?;
 
+        let mut polarity = CcLine::Cc1;
+        if port_type != PortType::Open {
+            polarity = self.polarity.ok_or(Error::UnknownPolarity)?;
+        }
+
         self.modify_register(registers::switches0::ADDR, |reg| {
             let open = reg
                 & !(registers::switches0::CC2_PU_EN
@@ -105,24 +118,45 @@ impl<T: Read + Write> Fusb302<T> {
                     | registers::switches0::CC2_PD_EN
                     | registers::switches0::CC1_PD_EN);
 
-            if matches!(port_type, PortType::Open) {
-                return open;
-            }
-
-            match port_type {
-                PortType::DFP => {
-                    open | registers::switches0::CC1_PU_EN | registers::switches0::CC2_PU_EN
-                }
-                PortType::UFP => {
+            match (polarity, port_type) {
+                (CcLine::Cc1, PortType::DFP) => open | registers::switches0::CC1_PU_EN,
+                (CcLine::Cc2, PortType::DFP) => open | registers::switches0::CC2_PU_EN,
+                (_, PortType::UFP) => {
                     open | registers::switches0::CC1_PD_EN | registers::switches0::CC2_PD_EN
                 }
-                PortType::Open => open,
+                (_, PortType::Open) => open,
             }
         })?;
+
+        match port_type {
+            PortType::DFP => {
+                self.configure_disconnect_monitoring()?;
+            }
+            PortType::UFP => {
+                unimplemented!();
+            }
+            PortType::Open => {
+                self.mask_all_interrutps()?;
+                self.configure_disconnect_monitoring()?;
+            }
+        }
 
         self.port_type = port_type;
 
         Ok(())
+    }
+
+    fn configure_disconnect_monitoring(&mut self) -> Result<(), Error<T>> {
+        let polarity = self.polarity;
+
+        self.modify_register(registers::switches0::ADDR, |reg| {
+            let off = reg & !(registers::switches0::MEAS_CC1 | registers::switches0::MEAS_CC2);
+            match polarity {
+                Some(CcLine::Cc1) => off | registers::switches0::MEAS_CC1,
+                Some(CcLine::Cc2) => off | registers::switches0::MEAS_CC2,
+                None => off,
+            }
+        })
     }
 
     pub fn detect_cc_orientation<U>(&mut self, timer: &mut U) -> Result<Option<CcLine>, Error<T>>
@@ -133,7 +167,9 @@ impl<T: Read + Write> Fusb302<T> {
         timer.delay_us(100);
         let cc2 = self.detect_rd_sink(CcLine::Cc2, timer)?;
 
-        if cc1 {
+        if cc1 && cc2 {
+            self.polarity = None
+        } else if cc1 {
             self.polarity = Some(CcLine::Cc1);
         } else if cc2 {
             self.polarity = Some(CcLine::Cc2);
@@ -148,7 +184,11 @@ impl<T: Read + Write> Fusb302<T> {
         self.polarity.is_some()
     }
 
-    pub fn detect_rd_sink<U>(&mut self, line: CcLine, timer: &mut U) -> Result<bool, Error<T>>
+    pub fn get_polarity(&self) -> Option<CcLine> {
+        self.polarity
+    }
+
+    fn detect_rd_sink<U>(&mut self, line: CcLine, timer: &mut U) -> Result<bool, Error<T>>
     where
         U: embedded_hal::blocking::delay::DelayUs<u32>,
     {
@@ -171,6 +211,13 @@ impl<T: Read + Write> Fusb302<T> {
             }
         })?;
 
+        self.monitor_connection(timer)
+    }
+
+    pub fn monitor_connection<U>(&mut self, timer: &mut U) -> Result<bool, Error<T>>
+    where
+        U: embedded_hal::blocking::delay::DelayUs<u32>,
+    {
         // TODO(javier-varez): Only USB default current is supported (80 uA current source for
         // pull-up) Seet table 3 (Host interrupt summary) in the datasheet
         const THRESHOLD_MV: u32 = 1600;

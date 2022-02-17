@@ -2,6 +2,7 @@
 #![no_main]
 
 mod fusb302;
+mod usb_fsm;
 
 use defmt_rtt as _; // global logger
 use panic_probe as _;
@@ -11,8 +12,6 @@ use nrf52840_hal as hal;
 use embedded_hal::blocking::delay::DelayUs;
 
 use embedded_hal::digital::v2::InputPin;
-
-use fusb302::{CcLine, PortType};
 
 // same panicking *behavior* as `panic-probe` but doesn't print a panic message
 // this prevents the panic message being printed *twice* when `defmt::panic` is invoked
@@ -47,32 +46,12 @@ fn main() -> ! {
 
     let mut timer = hal::timer::Timer::new(peripherals.TIMER0);
 
-    let mut fusb302 = fusb302::Fusb302::new(twim).unwrap();
-    fusb302.init().unwrap();
-    fusb302.reset_pd().unwrap();
-    fusb302.configure_cc_mode(PortType::DFP).unwrap();
+    let fusb302 = fusb302::Fusb302::new(twim).unwrap();
+    let mut state_machine = usb_fsm::UsbFsm::new(fusb302, irq_pin).unwrap();
 
-    let mut orientation = None;
     loop {
-        // No interrupts should be received yet, since they are off
-        if irq_pin.is_low().unwrap() {
-            defmt::info!("Irq from fusb302");
-        }
+        state_machine.run(&mut timer).unwrap();
 
-        // Make sure we are still connected to the right source
-        let new_orientation = fusb302.detect_cc_orientation(&mut timer).unwrap();
-        if new_orientation != orientation {
-            orientation = new_orientation;
-            match orientation {
-                Some(line) => {
-                    defmt::info!("Usb connected. {:?}", line);
-                }
-                None => {
-                    defmt::info!("Usb disconnected.");
-                }
-            }
-        }
-
-        timer.delay_us(1000u32);
+        timer.delay_us(10u32);
     }
 }
