@@ -53,15 +53,19 @@ impl<T: Read + Write> Fusb302<T> {
         Ok(register_value[0])
     }
 
+    fn modify_register<U>(&mut self, address: u8, closure: U) -> Result<(), Error<T>>
+    where
+        U: Fn(u8) -> u8,
+    {
+        let value = self.read_register(address)?;
+        let value = closure(value);
+        self.write_register(address, value)
+    }
+
     fn write_register(&mut self, address: u8, value: u8) -> Result<(), Error<T>> {
-        let addr_buffer = [address];
+        let addr_buffer = [address, value];
         self.i2c_bus
             .write(DEVICE_SLAVE_ADDR, &addr_buffer)
-            .map_err(|err| Error::IOWriteError(err))?;
-
-        let register_value = [value];
-        self.i2c_bus
-            .write(DEVICE_SLAVE_ADDR, &register_value)
             .map_err(|err| Error::IOWriteError(err))?;
 
         Ok(())
