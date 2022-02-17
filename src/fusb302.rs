@@ -1,5 +1,7 @@
 const DEVICE_SLAVE_ADDR: u8 = 0x22;
-const DEVICE_ID_REG: u8 = 0x01;
+const PD_RETRIES_COUNT: u8 = 3;
+
+mod registers;
 
 use embedded_hal::blocking::i2c::{Read, Write};
 
@@ -7,6 +9,7 @@ pub enum Error<T: Read + Write> {
     DeviceNotFound,
     IOReadError(<T as Read>::Error),
     IOWriteError(<T as Write>::Error),
+    UnknownPolarity,
 }
 
 impl<T: Read + Write> core::fmt::Debug for Error<T> {
@@ -15,28 +18,225 @@ impl<T: Read + Write> core::fmt::Debug for Error<T> {
             Error::IOReadError(_) => write!(f, "IO Error (Read)"),
             Error::IOWriteError(_) => write!(f, "IO Error (Write)"),
             Error::DeviceNotFound => write!(f, "DeviceNotFound"),
+            Error::UnknownPolarity => write!(f, "UnknownPolarity"),
         }
     }
 }
 
+#[derive(defmt::Format, Debug, Clone, Copy, PartialEq)]
+pub enum CcLine {
+    Cc1,
+    Cc2,
+}
+
+#[derive(defmt::Format, Debug, Clone, Copy, PartialEq)]
+pub enum PortType {
+    Open,
+    DFP,
+    UFP,
+}
+
 pub struct Fusb302<T: Read + Write> {
     i2c_bus: T,
+    polarity: Option<CcLine>,
+    port_type: PortType,
 }
 
 impl<T: Read + Write> Fusb302<T> {
     pub fn new(i2c_bus: T) -> Result<Self, Error<T>> {
         // Try to read device ID and verify it is connected, otherwise return an error
 
-        let mut instance = Self { i2c_bus };
-        let id = instance.read_register(DEVICE_ID_REG)?;
+        let mut instance = Self {
+            i2c_bus,
+            polarity: None,
+            port_type: PortType::Open,
+        };
+        let id = instance.read_register(registers::device_id::ADDR)?;
 
         // Check if device ID is valid
         if id & 0x80 == 0 {
             return Err(Error::DeviceNotFound);
         }
+
         defmt::info!("Found Fusb302 with ID {}", id);
 
         Ok(instance)
+    }
+
+    pub fn init(&mut self) -> Result<(), Error<T>> {
+        // Trigger a SW reset
+        self.write_register(registers::reset::ADDR, registers::reset::SW_RESET)?;
+
+        // Set auto retry and the num_retries to 3
+        self.modify_register(registers::control3::ADDR, |value| {
+            (value & !registers::control3::N_RETRIES_MASK)
+                | (PD_RETRIES_COUNT << registers::control3::N_RETRIES_OFFSET)
+                | registers::control3::AUTO_RETRY
+        })?;
+
+        self.write_register(
+            registers::control1::ADDR,
+            registers::control1::ENSOP1DB
+                | registers::control1::ENSOP2DB
+                | registers::control1::RX_FLUSH,
+        )?;
+
+        self.auto_goodcrc_enable(false)?;
+
+        // Enable power
+        self.write_register(registers::power::ADDR, registers::power::PWR_ALL_MASK)
+    }
+
+    pub fn reset_pd(&mut self) -> Result<(), Error<T>> {
+        self.write_register(registers::reset::ADDR, registers::reset::PD_RESET)
+    }
+
+    pub fn configure_cc_mode(&mut self, port_type: PortType) -> Result<(), Error<T>> {
+        self.modify_register(registers::control2::ADDR, |reg| {
+            reg & !registers::control2::TOGGLE
+        })?;
+
+        self.modify_register(registers::switches0::ADDR, |reg| {
+            let open = reg
+                & !(registers::switches0::CC2_PU_EN
+                    | registers::switches0::CC1_PU_EN
+                    | registers::switches0::CC2_VCONN_EN
+                    | registers::switches0::CC1_VCONN_EN
+                    | registers::switches0::CC2_PD_EN
+                    | registers::switches0::CC1_PD_EN);
+
+            if matches!(port_type, PortType::Open) {
+                return open;
+            }
+
+            match port_type {
+                PortType::DFP => {
+                    open | registers::switches0::CC1_PU_EN | registers::switches0::CC2_PU_EN
+                }
+                PortType::UFP => {
+                    open | registers::switches0::CC1_PD_EN | registers::switches0::CC2_PD_EN
+                }
+                PortType::Open => open,
+            }
+        })?;
+
+        self.port_type = port_type;
+
+        Ok(())
+    }
+
+    pub fn detect_cc_orientation<U>(&mut self, timer: &mut U) -> Result<Option<CcLine>, Error<T>>
+    where
+        U: embedded_hal::blocking::delay::DelayUs<u32>,
+    {
+        let cc1 = self.detect_rd_sink(CcLine::Cc1, timer)?;
+        timer.delay_us(100);
+        let cc2 = self.detect_rd_sink(CcLine::Cc2, timer)?;
+
+        if cc1 {
+            self.polarity = Some(CcLine::Cc1);
+        } else if cc2 {
+            self.polarity = Some(CcLine::Cc2);
+        } else {
+            self.polarity = None
+        }
+
+        Ok(self.polarity)
+    }
+
+    pub fn is_attached(&self) -> bool {
+        self.polarity.is_some()
+    }
+
+    pub fn detect_rd_sink<U>(&mut self, line: CcLine, timer: &mut U) -> Result<bool, Error<T>>
+    where
+        U: embedded_hal::blocking::delay::DelayUs<u32>,
+    {
+        self.modify_register(registers::switches0::ADDR, |reg| {
+            let open = reg
+                & !(registers::switches0::CC2_PU_EN
+                    | registers::switches0::CC1_PU_EN
+                    | registers::switches0::MEAS_CC1
+                    | registers::switches0::MEAS_CC2
+                    | registers::switches0::CC1_PD_EN
+                    | registers::switches0::CC2_PD_EN);
+
+            match line {
+                CcLine::Cc1 => {
+                    open | registers::switches0::MEAS_CC1 | registers::switches0::CC1_PU_EN
+                }
+                CcLine::Cc2 => {
+                    open | registers::switches0::MEAS_CC2 | registers::switches0::CC2_PU_EN
+                }
+            }
+        })?;
+
+        // TODO(javier-varez): Only USB default current is supported (80 uA current source for
+        // pull-up) Seet table 3 (Host interrupt summary) in the datasheet
+        const THRESHOLD_MV: u32 = 1600;
+
+        self.write_register(
+            registers::measure::ADDR,
+            registers::measure::mdac_threshold_from_mv(THRESHOLD_MV),
+        )?;
+
+        // Apply some blocking delay to stabilize the line
+        timer.delay_us(250);
+
+        if self.read_comp_status()? {
+            // No connection detected
+            return Ok(false);
+        }
+
+        // If some low voltage is detected it could be either due to Rd (sink) or Ra (cable). We
+        // need to reconfigure the mdac to sense the difference between the two
+
+        const RA_THRESHOLD_MV: u32 = 150;
+
+        self.write_register(
+            registers::measure::ADDR,
+            registers::measure::mdac_threshold_from_mv(RA_THRESHOLD_MV),
+        )?;
+
+        // Apply some blocking delay to stabilize the line
+        timer.delay_us(250);
+
+        if self.read_comp_status()? {
+            // Rd detected!
+            return Ok(true);
+        }
+
+        defmt::info!("Ra detected, is your cable an active cable?");
+        Ok(false)
+    }
+
+    fn read_comp_status(&mut self) -> Result<bool, Error<T>> {
+        self.read_register(registers::status0::ADDR)
+            .map(|val| (val & registers::status0::COMP) != 0)
+    }
+
+    fn auto_goodcrc_enable(&mut self, enable: bool) -> Result<(), Error<T>> {
+        self.modify_register(registers::switches1::ADDR, |reg| {
+            // Clear the spec rev. defaults are wrong
+            let reg = reg & !registers::switches1::SPECREV_MASK;
+            if enable {
+                reg | registers::switches1::AUTO_CRC
+            } else {
+                reg & !registers::switches1::AUTO_CRC
+            }
+        })
+    }
+
+    pub fn enable_interrupts(&mut self) -> Result<(), Error<T>> {
+        self.modify_register(registers::control0::ADDR, |reg| {
+            reg & !registers::control0::INT_MASK
+        })
+    }
+
+    pub fn disable_interrupts(&mut self) -> Result<(), Error<T>> {
+        self.modify_register(registers::control0::ADDR, |reg| {
+            reg | registers::control0::INT_MASK
+        })
     }
 
     fn read_register(&mut self, address: u8) -> Result<u8, Error<T>> {
