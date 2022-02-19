@@ -5,6 +5,8 @@ mod registers;
 
 use embedded_hal::blocking::i2c::{Read, Write};
 
+use heapless::Vec;
+
 pub enum Error<T: Read + Write> {
     DeviceNotFound,
     IOReadError(<T as Read>::Error),
@@ -40,6 +42,7 @@ pub struct Fusb302<T: Read + Write> {
     i2c_bus: T,
     polarity: Option<CcLine>,
     port_type: PortType,
+    current_msg_id: u8,
 }
 
 impl<T: Read + Write> Fusb302<T> {
@@ -50,6 +53,7 @@ impl<T: Read + Write> Fusb302<T> {
             i2c_bus,
             polarity: None,
             port_type: PortType::Open,
+            current_msg_id: 7,
         };
         let id = instance.read_register(registers::device_id::ADDR)?;
 
@@ -99,7 +103,7 @@ impl<T: Read + Write> Fusb302<T> {
         self.write_register(registers::reset::ADDR, registers::reset::PD_RESET)
     }
 
-    pub fn configure_cc_mode(&mut self, port_type: PortType) -> Result<(), Error<T>> {
+    pub fn configure_port_type(&mut self, port_type: PortType) -> Result<(), Error<T>> {
         self.modify_register(registers::control2::ADDR, |reg| {
             reg & !registers::control2::TOGGLE
         })?;
@@ -128,22 +132,42 @@ impl<T: Read + Write> Fusb302<T> {
             }
         })?;
 
+        self.configure_cc_tx_driver(port_type, polarity)?;
+
         match port_type {
             PortType::DFP => {
                 self.configure_disconnect_monitoring()?;
+                self.auto_goodcrc_enable(true)?;
             }
             PortType::UFP => {
                 unimplemented!();
             }
             PortType::Open => {
-                self.mask_all_interrutps()?;
+                self.auto_goodcrc_enable(false)?;
                 self.configure_disconnect_monitoring()?;
+                self.mask_all_interrutps()?;
             }
         }
 
         self.port_type = port_type;
 
         Ok(())
+    }
+
+    fn configure_cc_tx_driver(
+        &mut self,
+        port_type: PortType,
+        polarity: CcLine,
+    ) -> Result<(), Error<T>> {
+        self.modify_register(registers::switches1::ADDR, |reg| {
+            let open = reg & !(registers::switches1::TXCC1_EN | registers::switches1::TXCC2_EN);
+
+            match (polarity, port_type) {
+                (_, PortType::Open) => open,
+                (CcLine::Cc1, _) => open | registers::switches1::TXCC1_EN,
+                (CcLine::Cc2, _) => open | registers::switches1::TXCC2_EN,
+            }
+        })
     }
 
     fn configure_disconnect_monitoring(&mut self) -> Result<(), Error<T>> {
@@ -178,10 +202,6 @@ impl<T: Read + Write> Fusb302<T> {
         }
 
         Ok(self.polarity)
-    }
-
-    pub fn is_attached(&self) -> bool {
-        self.polarity.is_some()
     }
 
     pub fn get_polarity(&self) -> Option<CcLine> {
@@ -316,5 +336,243 @@ impl<T: Read + Write> Fusb302<T> {
             .map_err(|err| Error::IOWriteError(err))?;
 
         Ok(())
+    }
+
+    pub fn enable_tx_sent_irq(&mut self) -> Result<(), Error<T>> {
+        self.modify_register(registers::maska::ADDR, |reg| {
+            reg & !(registers::maska::TX_SENT)
+        })
+    }
+
+    pub fn handle_irq(&mut self) -> Result<(), Error<T>> {
+        let value = self.read_register(registers::interrupta::ADDR)?;
+        if (value & registers::interrupta::TX_SENT) != 0 {
+            defmt::info!("TX Sent IRQ received");
+        }
+        Ok(())
+    }
+
+    pub fn send_message(
+        &mut self,
+        sop_target: SopTarget,
+        message: &dyn Message,
+    ) -> Result<(), Error<T>> {
+        const MAX_MSG_SIZE: usize = 42;
+
+        let mut header = message.get_header();
+        let objects = message.get_data();
+
+        self.current_msg_id += 1;
+        if self.current_msg_id > 7 {
+            self.current_msg_id = 0;
+        }
+        header.set_id(self.current_msg_id);
+
+        let mut buffer: Vec<u8, MAX_MSG_SIZE> = Vec::new();
+        buffer.push(registers::fifo::ADDR).unwrap();
+
+        // Send sop target tokens
+        for token in sop_target.into_tokens() {
+            buffer.push(token).unwrap();
+        }
+
+        // At least 2 for the header + num_objects * 4
+        let num_bytes =
+            (core::mem::size_of::<u16>() + objects.len() * core::mem::size_of::<u32>()) as u8;
+        assert!(num_bytes < 30);
+
+        // Send data packets
+        buffer
+            .push(registers::fifo::tx_tokens::PACKSYM | num_bytes)
+            .unwrap();
+
+        // Send header
+        let header = header.into_inner();
+        buffer.push((header & 0xff) as u8).unwrap();
+        buffer.push((header >> 8) as u8).unwrap();
+
+        // Push data
+        for obj in objects {
+            buffer.push((obj & 0xFF) as u8).unwrap();
+            buffer.push(((obj >> 8) & 0xFF) as u8).unwrap();
+            buffer.push(((obj >> 16) & 0xFF) as u8).unwrap();
+            buffer.push(((obj >> 24) & 0xFF) as u8).unwrap();
+        }
+
+        buffer.push(registers::fifo::tx_tokens::JAM_CRC).unwrap();
+        buffer.push(registers::fifo::tx_tokens::EOP).unwrap();
+        buffer.push(registers::fifo::tx_tokens::TX_OFF).unwrap();
+
+        // Turn on TX
+        buffer.push(registers::fifo::tx_tokens::TX_ON).unwrap();
+
+        self.i2c_bus
+            .write(DEVICE_SLAVE_ADDR, &buffer)
+            .map_err(|err| Error::IOWriteError(err))
+
+        // TODO(javier-varez): Could make this (or a variant) blocking so that we don't have to
+        // wait externally...
+        //
+        // As a minimum it should fail if another transfer is already in-flight until it has
+        // completed
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum SopTarget {
+    SOP,
+    SOP1,
+    SOP2,
+    SOP1DB,
+    SOP2DB,
+}
+
+impl SopTarget {
+    fn into_tokens(self) -> [u8; 4] {
+        match self {
+            SopTarget::SOP => [
+                registers::fifo::tx_tokens::SYNC1,
+                registers::fifo::tx_tokens::SYNC1,
+                registers::fifo::tx_tokens::SYNC1,
+                registers::fifo::tx_tokens::SYNC2,
+            ],
+            _ => {
+                unimplemented!();
+            }
+        }
+    }
+}
+
+const MAX_DATA_OBJECTS: usize = 7;
+
+pub trait Message {
+    fn get_header(&self) -> MessageHeader;
+    fn get_data(&self) -> Vec<u32, MAX_DATA_OBJECTS>;
+}
+
+#[repr(u16)]
+#[derive(Debug, Clone, Copy)]
+enum ControlMessageType {
+    // Control messages
+    GoodCrc = 1,
+    GotoMin = 2,
+    Accept = 3,
+    Reject = 4,
+    Ping = 5,
+    PsRdy = 6,
+    GetSourceCap = 7,
+    GetSinkCap = 8,
+    DrSwap = 9,
+    PrSwap = 10,
+    VconnSwap = 11,
+    Wait = 12,
+    SoftReset = 13,
+}
+
+#[repr(u16)]
+#[derive(Debug, Clone, Copy)]
+enum DataMessageType {
+    SourceCapabilities = 1,
+    Request = 2,
+    BIST = 3,
+    SinkCapabilities = 4,
+    VendorDefined = 15,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MessageType {
+    // Arg0: the type of the control message
+    ControlMessage(ControlMessageType),
+    // Arg0: the type of the data message
+    // Arg1: the number of data objects
+    DataMessage(DataMessageType, u16),
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(u16)]
+enum Revision {
+    R1_0 = 0b00,
+    R2_0 = 0b01,
+}
+
+pub struct MessageHeader(u16);
+
+impl MessageHeader {
+    const NUM_DATA_OBJ_OFFSET: u8 = 12;
+    const SPEC_REVISION_OFFSET: u8 = 6;
+    const ID_OFFSET: u8 = 9;
+    const ID_MASK: u16 = 7 << 9;
+    const PDR_MASK: u16 = 1 << 5;
+    const PPR_MASK: u16 = 1 << 8;
+
+    // Assumptions:
+    // DFP is always source
+    // We are never cable plug
+    const fn new(
+        msg_type: MessageType,
+        port_type: Option<PortType>,
+        revision: Revision,
+        id: u8,
+    ) -> Self {
+        let mut header_bits = match msg_type {
+            MessageType::ControlMessage(r#type) => r#type as u16,
+            MessageType::DataMessage(r#type, num_objects) => {
+                (r#type as u16) | (num_objects << Self::NUM_DATA_OBJ_OFFSET)
+            }
+        };
+
+        header_bits |= (revision as u16) << Self::SPEC_REVISION_OFFSET;
+
+        if matches!(port_type, Some(PortType::DFP)) {
+            header_bits |= Self::PDR_MASK | Self::PPR_MASK;
+        }
+
+        Self(header_bits)
+    }
+
+    fn set_id(&mut self, id: u8) {
+        self.0 = self.0 | ((id as u16) << Self::ID_OFFSET) & Self::ID_MASK;
+    }
+
+    fn into_inner(&self) -> u16 {
+        self.0
+    }
+}
+
+struct PowerDataObject(u32);
+
+impl PowerDataObject {
+    fn new_fixed_safe5v_0ma() -> Self {
+        const FIXED_VOLTAGE_OFFSET: usize = 10;
+        const VOLTAGE_LSB_MV: u32 = 50;
+
+        const VSAFE5V_MV: u32 = 5000;
+
+        let voltage = (VSAFE5V_MV / VOLTAGE_LSB_MV) << FIXED_VOLTAGE_OFFSET;
+
+        Self(voltage)
+    }
+}
+
+// TODO(javier-varez): Add support to other supplies when we have them.
+pub struct SourceCapabilitiesMessage {}
+
+impl SourceCapabilitiesMessage {
+    pub const fn new_no_capabilities() -> Self {
+        Self {}
+    }
+}
+
+impl Message for SourceCapabilitiesMessage {
+    fn get_header(&self) -> MessageHeader {
+        let msg_type = MessageType::DataMessage(DataMessageType::SourceCapabilities, 1);
+        MessageHeader::new(msg_type, Some(PortType::DFP), Revision::R1_0, 0)
+    }
+
+    fn get_data(&self) -> Vec<u32, MAX_DATA_OBJECTS> {
+        let mut objects = Vec::new();
+        let fixed_supply = PowerDataObject::new_fixed_safe5v_0ma();
+        objects.push(fixed_supply.0).unwrap();
+        objects
     }
 }

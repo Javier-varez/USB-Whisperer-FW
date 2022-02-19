@@ -24,19 +24,26 @@ pub mod switches1 {
     pub const ADDR: u8 = 0x03;
     pub const AUTO_CRC: u8 = 1 << 2;
     pub const SPECREV_MASK: u8 = 0x03 << 5;
+    pub const TXCC1_EN: u8 = 1 << 0;
+    pub const TXCC2_EN: u8 = 1 << 1;
 }
 
 pub mod mask {
     pub const ADDR: u8 = 0x0A;
-    pub const MASK_BC_LVL: u8 = 1 << 0;
 }
 
 pub mod maska {
     pub const ADDR: u8 = 0x0E;
+    pub const TX_SENT: u8 = 1 << 2;
 }
 
 pub mod maskb {
     pub const ADDR: u8 = 0x0F;
+}
+
+pub mod interrupta {
+    pub const ADDR: u8 = 0x3E;
+    pub const TX_SENT: u8 = 1 << 2;
 }
 
 pub mod control0 {
@@ -81,4 +88,30 @@ pub mod measure {
 pub mod status0 {
     pub const ADDR: u8 = 0x40;
     pub const COMP: u8 = 1 << 5;
+}
+
+pub mod fifo {
+    pub const ADDR: u8 = 0x43;
+
+    pub mod tx_tokens {
+        pub const TX_ON: u8 = 0xA1;
+        pub const SYNC1: u8 = 0x12;
+        pub const SYNC2: u8 = 0x13;
+        pub const SYNC3: u8 = 0x1B;
+        pub const RESET1: u8 = 0x15;
+        pub const RESET2: u8 = 0x16;
+        pub const PACKSYM: u8 = 0x80;
+        pub const JAM_CRC: u8 = 0xFF;
+        pub const EOP: u8 = 0x14;
+        pub const TX_OFF: u8 = 0xFE;
+    }
+
+    pub mod rx_tokens {
+        pub const MASK: u8 = 0xE0;
+        pub const SOP: u8 = 0xE0;
+        pub const SOP1: u8 = 0xC0;
+        pub const SOP2: u8 = 0xA0;
+        pub const SOP1DB: u8 = 0x80;
+        pub const SOP2DB: u8 = 0x60;
+    }
 }

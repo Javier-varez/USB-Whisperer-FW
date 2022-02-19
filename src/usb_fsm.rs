@@ -13,7 +13,9 @@ use embedded_hal::{
 enum State {
     Disconnected,
     DebounceConnection,
-    ApplyVbusAndVconn,
+    ApplyVbus,
+    SendSourceCapabilities,
+    PowerNegotiation,
     Connected,
 }
 
@@ -56,8 +58,9 @@ where
     pub fn new(mut pd_controller: Fusb302<T>, irq_pin: U) -> Result<Self, Error<T>> {
         pd_controller.init()?;
         pd_controller.reset_pd()?;
-        pd_controller.configure_cc_mode(fusb302::PortType::Open)?;
+        pd_controller.configure_port_type(fusb302::PortType::Open)?;
         pd_controller.enable_interrupts()?;
+        pd_controller.enable_tx_sent_irq()?;
 
         Ok(Self {
             pd_controller,
@@ -70,6 +73,7 @@ where
         // No interrupts should be received yet, since they are off
         if self.irq_pin.is_low().unwrap_or(false) {
             defmt::info!("Irq from fusb302");
+            self.pd_controller.handle_irq()?;
         }
 
         match self.current_state {
@@ -84,7 +88,7 @@ where
                 let detected_orientation = self.pd_controller.get_polarity().unwrap();
                 match self.pd_controller.detect_cc_orientation(timer)? {
                     Some(orientation) if orientation == detected_orientation => {
-                        self.trigger_transition(State::ApplyVbusAndVconn);
+                        self.trigger_transition(State::ApplyVbus);
                     }
                     Some(orientation) => {
                         defmt::warn!("Orientation {} does not match", orientation);
@@ -96,16 +100,30 @@ where
                     }
                 }
             }
-            State::ApplyVbusAndVconn => {
+            State::ApplyVbus => {
                 self.pd_controller
-                    .configure_cc_mode(fusb302::PortType::DFP)?;
-                self.trigger_transition(State::Connected);
+                    .configure_port_type(fusb302::PortType::DFP)?;
+                // TODO(javier-varez): Enable Vbus here. It's unclear how to do this with the
+                // current design
+                self.trigger_transition(State::SendSourceCapabilities);
+            }
+            State::SendSourceCapabilities => {
+                let caps = fusb302::SourceCapabilitiesMessage::new_no_capabilities();
+                self.pd_controller
+                    .send_message(fusb302::SopTarget::SOP, &caps)?;
+
+                // TODO(javier-varez): Wait for Ack before transitioning
+                self.trigger_transition(State::PowerNegotiation);
+            }
+            State::PowerNegotiation => {
+                // TODO(javier-varez): Wait until the sink sends a request packet and we are ok
+                // with it. Then transition to connected
             }
             State::Connected => {
                 if !self.pd_controller.monitor_connection(timer)? {
                     defmt::info!("Device disconnected");
                     self.pd_controller
-                        .configure_cc_mode(fusb302::PortType::Open)?;
+                        .configure_port_type(fusb302::PortType::Open)?;
                     self.trigger_transition(State::Disconnected);
                 }
             }
