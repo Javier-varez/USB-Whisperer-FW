@@ -35,6 +35,7 @@ pub mod mask {
 pub mod maska {
     pub const ADDR: u8 = 0x0E;
     pub const TX_SENT: u8 = 1 << 2;
+    pub const RETRYFAIL: u8 = 1 << 4;
 }
 
 pub mod maskb {
@@ -42,9 +43,14 @@ pub mod maskb {
     pub const GCRCSENT: u8 = 1 << 0;
 }
 
+pub mod interrupt {
+    pub const ADDR: u8 = 0x42;
+}
+
 pub mod interrupta {
     pub const ADDR: u8 = 0x3E;
     pub const TX_SENT: u8 = 1 << 2;
+    pub const RETRYFAIL: u8 = 1 << 4;
 }
 
 pub mod interruptb {
@@ -55,6 +61,7 @@ pub mod interruptb {
 pub mod control0 {
     pub const ADDR: u8 = 0x06;
     pub const INT_MASK: u8 = 1 << 5;
+    pub const TX_FLUSH: u8 = 1 << 6;
 }
 
 pub mod control1 {
@@ -74,6 +81,7 @@ pub mod control3 {
     pub const AUTO_RETRY: u8 = 0x01;
     pub const N_RETRIES_MASK: u8 = 0x06;
     pub const N_RETRIES_OFFSET: u8 = 1;
+    pub const SEND_HARD_RESET: u8 = 1 << 6;
 }
 
 pub mod power {
@@ -99,6 +107,14 @@ pub mod status0 {
 pub mod status1 {
     pub const ADDR: u8 = 0x41;
     pub const RX_EMPTY: u8 = 1 << 5;
+}
+
+pub mod status0a {
+    pub const ADDR: u8 = 0x3c;
+}
+
+pub mod status1a {
+    pub const ADDR: u8 = 0x3d;
 }
 
 pub mod fifo {

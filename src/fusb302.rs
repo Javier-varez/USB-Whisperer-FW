@@ -14,6 +14,7 @@ pub enum Error<T: WriteRead + Write> {
     UnknownPolarity,
     InvalidHeader,
     TxInProgress,
+    ErrorState,
 }
 
 impl<T: WriteRead + Write> core::fmt::Debug for Error<T> {
@@ -25,6 +26,7 @@ impl<T: WriteRead + Write> core::fmt::Debug for Error<T> {
             Error::UnknownPolarity => write!(f, "UnknownPolarity"),
             Error::InvalidHeader => write!(f, "InvalidHeader"),
             Error::TxInProgress => write!(f, "TxInProgress"),
+            Error::ErrorState => write!(f, "ErrorState"),
         }
     }
 }
@@ -99,6 +101,35 @@ impl<T: WriteRead + Write> Fusb302<T> {
         self.write_register(registers::power::ADDR, registers::power::PWR_ALL_MASK)
     }
 
+    pub fn flush_fifo(&mut self) -> Result<(), Error<T>> {
+        self.modify_register(registers::control1::ADDR, |reg| {
+            reg | registers::control1::RX_FLUSH
+        })?;
+
+        self.modify_register(registers::control0::ADDR, |reg| {
+            reg | registers::control0::TX_FLUSH
+        })
+    }
+
+    pub fn print_status_regs(&mut self) -> Result<(), Error<T>> {
+        let status0 = self.read_register(registers::status0::ADDR)?;
+        let status1 = self.read_register(registers::status1::ADDR)?;
+        let status0a = self.read_register(registers::status0a::ADDR)?;
+        let status1a = self.read_register(registers::status1a::ADDR)?;
+        let interrupt = self.read_register(registers::interrupt::ADDR)?;
+        let interrupta = self.read_register(registers::interrupta::ADDR)?;
+        let interruptb = self.read_register(registers::interruptb::ADDR)?;
+
+        defmt::error!("status0 = 0x{:x}", status0);
+        defmt::error!("status1 = 0x{:x}", status1);
+        defmt::error!("status0a = 0x{:x}", status0a);
+        defmt::error!("status1a = 0x{:x}", status1a);
+        defmt::error!("interrupt = 0x{:x}", interrupt);
+        defmt::error!("interrupta = 0x{:x}", interrupta);
+        defmt::error!("interruptb = 0x{:x}", interruptb);
+        Ok(())
+    }
+
     fn mask_all_interrutps(&mut self) -> Result<(), Error<T>> {
         self.write_register(registers::mask::ADDR, 0xff)?;
         self.write_register(registers::maska::ADDR, 0xff)?;
@@ -106,6 +137,7 @@ impl<T: WriteRead + Write> Fusb302<T> {
     }
 
     pub fn reset_pd(&mut self) -> Result<(), Error<T>> {
+        self.tx_in_progress = false;
         self.write_register(registers::reset::ADDR, registers::reset::PD_RESET)
     }
 
@@ -151,7 +183,6 @@ impl<T: WriteRead + Write> Fusb302<T> {
             PortType::Open => {
                 self.auto_goodcrc_enable(false)?;
                 self.configure_disconnect_monitoring()?;
-                self.mask_all_interrutps()?;
             }
         }
 
@@ -361,16 +392,35 @@ impl<T: WriteRead + Write> Fusb302<T> {
         })
     }
 
+    pub fn configure_retry_fail_irq(&mut self, enable: bool) -> Result<(), Error<T>> {
+        self.modify_register(registers::maska::ADDR, |reg| {
+            if enable {
+                reg & !(registers::maska::RETRYFAIL)
+            } else {
+                reg | registers::maska::RETRYFAIL
+            }
+        })
+    }
+
     pub fn handle_irq(&mut self) -> Result<bool, Error<T>> {
         let mut received_messages = false;
 
         let irqa = self.read_register(registers::interrupta::ADDR)?;
+        let irqb = self.read_register(registers::interruptb::ADDR)?;
+        defmt::dbg!("irqa 0x{:x}", irqa);
+        defmt::dbg!("irqb 0x{:x}", irqb);
+
+        if (irqa & registers::interrupta::RETRYFAIL) != 0 {
+            defmt::error!("Device in error state. Retries failed.");
+            self.tx_in_progress = false;
+            // return Err(Error::ErrorState);
+        }
+
         if (irqa & registers::interrupta::TX_SENT) != 0 {
             defmt::info!("TX Sent IRQ received");
             self.tx_in_progress = false;
         }
 
-        let irqb = self.read_register(registers::interruptb::ADDR)?;
         if (irqb & registers::interruptb::GCRCSENT) != 0 {
             defmt::info!("Good crc sent, message has been received");
             received_messages = true;
@@ -379,6 +429,11 @@ impl<T: WriteRead + Write> Fusb302<T> {
         Ok(received_messages)
     }
 
+    pub fn send_hard_reset(&mut self) -> Result<(), Error<T>> {
+        self.modify_register(registers::control3::ADDR, |reg| {
+            reg | registers::control3::SEND_HARD_RESET
+        })
+    }
     pub fn send_message(
         &mut self,
         sop_target: SopTarget,
