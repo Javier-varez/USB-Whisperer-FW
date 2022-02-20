@@ -50,6 +50,6 @@ fn main() -> ! {
     loop {
         state_machine.run(&mut timer).unwrap();
 
-        timer.delay_us(10u32);
+        timer.delay_us(10_000u32);
     }
 }

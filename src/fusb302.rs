@@ -12,6 +12,8 @@ pub enum Error<T: WriteRead + Write> {
     IOReadError(<T as WriteRead>::Error),
     IOWriteError(<T as Write>::Error),
     UnknownPolarity,
+    InvalidHeader,
+    TxInProgress,
 }
 
 impl<T: WriteRead + Write> core::fmt::Debug for Error<T> {
@@ -21,6 +23,8 @@ impl<T: WriteRead + Write> core::fmt::Debug for Error<T> {
             Error::IOWriteError(_) => write!(f, "IO Error (Write)"),
             Error::DeviceNotFound => write!(f, "DeviceNotFound"),
             Error::UnknownPolarity => write!(f, "UnknownPolarity"),
+            Error::InvalidHeader => write!(f, "InvalidHeader"),
+            Error::TxInProgress => write!(f, "TxInProgress"),
         }
     }
 }
@@ -35,7 +39,7 @@ pub enum CcLine {
 pub enum PortType {
     Open,
     DFP,
-    UFP,
+    _UFP,
 }
 
 pub struct Fusb302<T: WriteRead + Write> {
@@ -43,6 +47,7 @@ pub struct Fusb302<T: WriteRead + Write> {
     polarity: Option<CcLine>,
     port_type: PortType,
     current_msg_id: u8,
+    tx_in_progress: bool,
 }
 
 impl<T: WriteRead + Write> Fusb302<T> {
@@ -54,6 +59,7 @@ impl<T: WriteRead + Write> Fusb302<T> {
             polarity: None,
             port_type: PortType::Open,
             current_msg_id: 7,
+            tx_in_progress: false,
         };
         let id = instance.read_register(registers::device_id::ADDR)?;
 
@@ -125,7 +131,7 @@ impl<T: WriteRead + Write> Fusb302<T> {
             match (polarity, port_type) {
                 (CcLine::Cc1, PortType::DFP) => open | registers::switches0::CC1_PU_EN,
                 (CcLine::Cc2, PortType::DFP) => open | registers::switches0::CC2_PU_EN,
-                (_, PortType::UFP) => {
+                (_, PortType::_UFP) => {
                     open | registers::switches0::CC1_PD_EN | registers::switches0::CC2_PD_EN
                 }
                 (_, PortType::Open) => open,
@@ -139,7 +145,7 @@ impl<T: WriteRead + Write> Fusb302<T> {
                 self.configure_disconnect_monitoring()?;
                 self.auto_goodcrc_enable(true)?;
             }
-            PortType::UFP => {
+            PortType::_UFP => {
                 unimplemented!();
             }
             PortType::Open => {
@@ -300,7 +306,7 @@ impl<T: WriteRead + Write> Fusb302<T> {
         })
     }
 
-    pub fn disable_interrupts(&mut self) -> Result<(), Error<T>> {
+    pub fn _disable_interrupts(&mut self) -> Result<(), Error<T>> {
         self.modify_register(registers::control0::ADDR, |reg| {
             reg | registers::control0::INT_MASK
         })
@@ -335,18 +341,42 @@ impl<T: WriteRead + Write> Fusb302<T> {
         Ok(())
     }
 
-    pub fn enable_tx_sent_irq(&mut self) -> Result<(), Error<T>> {
+    pub fn configure_tx_sent_irq(&mut self, enable: bool) -> Result<(), Error<T>> {
         self.modify_register(registers::maska::ADDR, |reg| {
-            reg & !(registers::maska::TX_SENT)
+            if enable {
+                reg & !(registers::maska::TX_SENT)
+            } else {
+                reg | registers::maska::TX_SENT
+            }
         })
     }
 
-    pub fn handle_irq(&mut self) -> Result<(), Error<T>> {
-        let value = self.read_register(registers::interrupta::ADDR)?;
-        if (value & registers::interrupta::TX_SENT) != 0 {
+    pub fn configure_rx_recv_irq(&mut self, enable: bool) -> Result<(), Error<T>> {
+        self.modify_register(registers::maskb::ADDR, |reg| {
+            if enable {
+                reg & !(registers::maskb::GCRCSENT)
+            } else {
+                reg | registers::maskb::GCRCSENT
+            }
+        })
+    }
+
+    pub fn handle_irq(&mut self) -> Result<bool, Error<T>> {
+        let mut received_messages = false;
+
+        let irqa = self.read_register(registers::interrupta::ADDR)?;
+        if (irqa & registers::interrupta::TX_SENT) != 0 {
             defmt::info!("TX Sent IRQ received");
+            self.tx_in_progress = false;
         }
-        Ok(())
+
+        let irqb = self.read_register(registers::interruptb::ADDR)?;
+        if (irqb & registers::interruptb::GCRCSENT) != 0 {
+            defmt::info!("Good crc sent, message has been received");
+            received_messages = true;
+        }
+
+        Ok(received_messages)
     }
 
     pub fn send_message(
@@ -355,6 +385,10 @@ impl<T: WriteRead + Write> Fusb302<T> {
         message: &dyn Message,
     ) -> Result<(), Error<T>> {
         const MAX_MSG_SIZE: usize = 42;
+
+        if self.tx_in_progress {
+            return Err(Error::TxInProgress);
+        }
 
         let mut header = message.get_header();
         let objects = message.get_data();
@@ -405,13 +439,72 @@ impl<T: WriteRead + Write> Fusb302<T> {
 
         self.i2c_bus
             .write(DEVICE_SLAVE_ADDR, &buffer)
-            .map_err(|err| Error::IOWriteError(err))
+            .map_err(|err| Error::IOWriteError(err))?;
+
+        self.tx_in_progress = true;
+        Ok(())
 
         // TODO(javier-varez): Could make this (or a variant) blocking so that we don't have to
         // wait externally...
-        //
-        // As a minimum it should fail if another transfer is already in-flight until it has
-        // completed
+    }
+
+    pub fn is_rx_fifo_empty(&mut self) -> Result<bool, Error<T>> {
+        let status1 = self.read_register(registers::status1::ADDR)?;
+        Ok((status1 & registers::status1::RX_EMPTY) != 0)
+    }
+
+    pub fn receive_message(&mut self) -> Result<(SopTarget, MessageHeader, Vec<u8, 28>), Error<T>> {
+        // Receive token and header
+        let reg_addr = [registers::fifo::ADDR];
+        let mut token_and_header = [0; 3];
+        self.i2c_bus
+            .write_read(DEVICE_SLAVE_ADDR, &reg_addr, &mut token_and_header)
+            .map_err(|err| Error::IOReadError(err))?;
+
+        let header = MessageHeader::from_inner(
+            (token_and_header[1] as u16) | ((token_and_header[2] as u16) << 8),
+        );
+
+        let msg_type = header.message_type()?;
+        let sop_target = match token_and_header[0] & registers::fifo::rx_tokens::MASK {
+            registers::fifo::rx_tokens::SOP => {
+                defmt::info!("SOP recv {}", msg_type);
+                SopTarget::SOP
+            }
+            registers::fifo::rx_tokens::SOP1 => {
+                defmt::info!("SOP' recv {}", msg_type);
+                SopTarget::SOP1
+            }
+            registers::fifo::rx_tokens::SOP2 => {
+                defmt::info!("SOP'' recv {}", msg_type);
+                SopTarget::SOP2
+            }
+            registers::fifo::rx_tokens::SOP1DB => {
+                defmt::info!("SOP'Debug recv {}", msg_type);
+                SopTarget::SOP1DB
+            }
+            registers::fifo::rx_tokens::SOP2DB => {
+                defmt::info!("SOP''Debug recv {}", msg_type);
+                SopTarget::SOP2DB
+            }
+            _ => panic!("Unknown packet received {:?}", msg_type),
+        };
+
+        // Now read the rest of the message from the fifo
+        let num_objects = header.num_objects();
+        let num_bytes = num_objects * core::mem::size_of::<u32>();
+
+        let mut raw_objects: Vec<u8, 28> = Vec::new();
+        // Add 4 for the CRC
+        raw_objects.resize(num_bytes + 4, 0).unwrap(); // Should always be < 7 by design
+
+        self.i2c_bus
+            .write_read(DEVICE_SLAVE_ADDR, &reg_addr, &mut raw_objects)
+            .map_err(|err| Error::IOReadError(err))?;
+
+        defmt::info!("Objects = {:?}", &raw_objects[..]);
+
+        Ok((sop_target, header, raw_objects))
     }
 }
 
@@ -433,9 +526,30 @@ impl SopTarget {
                 registers::fifo::tx_tokens::SYNC1,
                 registers::fifo::tx_tokens::SYNC2,
             ],
-            _ => {
-                unimplemented!();
-            }
+            SopTarget::SOP1 => [
+                registers::fifo::tx_tokens::SYNC1,
+                registers::fifo::tx_tokens::SYNC1,
+                registers::fifo::tx_tokens::SYNC3,
+                registers::fifo::tx_tokens::SYNC3,
+            ],
+            SopTarget::SOP2 => [
+                registers::fifo::tx_tokens::SYNC1,
+                registers::fifo::tx_tokens::SYNC3,
+                registers::fifo::tx_tokens::SYNC1,
+                registers::fifo::tx_tokens::SYNC3,
+            ],
+            SopTarget::SOP1DB => [
+                registers::fifo::tx_tokens::SYNC1,
+                registers::fifo::tx_tokens::RESET2,
+                registers::fifo::tx_tokens::RESET2,
+                registers::fifo::tx_tokens::SYNC3,
+            ],
+            SopTarget::SOP2DB => [
+                registers::fifo::tx_tokens::SYNC1,
+                registers::fifo::tx_tokens::RESET2,
+                registers::fifo::tx_tokens::SYNC3,
+                registers::fifo::tx_tokens::SYNC2,
+            ],
         }
     }
 }
@@ -448,8 +562,8 @@ pub trait Message {
 }
 
 #[repr(u16)]
-#[derive(Debug, Clone, Copy)]
-enum ControlMessageType {
+#[derive(Debug, Clone, Copy, defmt::Format)]
+pub enum ControlMessageType {
     // Control messages
     GoodCrc = 1,
     GotoMin = 2,
@@ -466,9 +580,31 @@ enum ControlMessageType {
     SoftReset = 13,
 }
 
+impl TryFrom<u16> for ControlMessageType {
+    type Error = ();
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(ControlMessageType::GoodCrc),
+            2 => Ok(ControlMessageType::GotoMin),
+            3 => Ok(ControlMessageType::Accept),
+            4 => Ok(ControlMessageType::Reject),
+            5 => Ok(ControlMessageType::Ping),
+            6 => Ok(ControlMessageType::PsRdy),
+            7 => Ok(ControlMessageType::GetSourceCap),
+            8 => Ok(ControlMessageType::GetSinkCap),
+            9 => Ok(ControlMessageType::DrSwap),
+            10 => Ok(ControlMessageType::PrSwap),
+            11 => Ok(ControlMessageType::VconnSwap),
+            12 => Ok(ControlMessageType::Wait),
+            13 => Ok(ControlMessageType::SoftReset),
+            _ => Err(()),
+        }
+    }
+}
+
 #[repr(u16)]
-#[derive(Debug, Clone, Copy)]
-enum DataMessageType {
+#[derive(Debug, Clone, Copy, defmt::Format)]
+pub enum DataMessageType {
     SourceCapabilities = 1,
     Request = 2,
     BIST = 3,
@@ -476,8 +612,22 @@ enum DataMessageType {
     VendorDefined = 15,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum MessageType {
+impl TryFrom<u16> for DataMessageType {
+    type Error = ();
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(DataMessageType::SourceCapabilities),
+            2 => Ok(DataMessageType::Request),
+            3 => Ok(DataMessageType::BIST),
+            4 => Ok(DataMessageType::SinkCapabilities),
+            5 => Ok(DataMessageType::VendorDefined),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, defmt::Format)]
+pub enum MessageType {
     // Arg0: the type of the control message
     ControlMessage(ControlMessageType),
     // Arg0: the type of the data message
@@ -489,28 +639,25 @@ enum MessageType {
 #[repr(u16)]
 enum Revision {
     R1_0 = 0b00,
-    R2_0 = 0b01,
+    _R2_0 = 0b01,
 }
 
 pub struct MessageHeader(u16);
 
 impl MessageHeader {
     const NUM_DATA_OBJ_OFFSET: u8 = 12;
+    const NUM_DATA_OBJ_MASK: u16 = 0x7 << Self::NUM_DATA_OBJ_OFFSET;
     const SPEC_REVISION_OFFSET: u8 = 6;
     const ID_OFFSET: u8 = 9;
     const ID_MASK: u16 = 7 << 9;
     const PDR_MASK: u16 = 1 << 5;
     const PPR_MASK: u16 = 1 << 8;
+    const TYPE_MASK: u16 = 0x0f << 0;
 
     // Assumptions:
     // DFP is always source
     // We are never cable plug
-    const fn new(
-        msg_type: MessageType,
-        port_type: Option<PortType>,
-        revision: Revision,
-        id: u8,
-    ) -> Self {
+    const fn new(msg_type: MessageType, port_type: Option<PortType>, revision: Revision) -> Self {
         let mut header_bits = match msg_type {
             MessageType::ControlMessage(r#type) => r#type as u16,
             MessageType::DataMessage(r#type, num_objects) => {
@@ -527,12 +674,33 @@ impl MessageHeader {
         Self(header_bits)
     }
 
+    const fn from_inner(inner: u16) -> Self {
+        Self(inner)
+    }
+
     fn set_id(&mut self, id: u8) {
         self.0 = self.0 | ((id as u16) << Self::ID_OFFSET) & Self::ID_MASK;
     }
 
-    fn into_inner(&self) -> u16 {
+    const fn into_inner(&self) -> u16 {
         self.0
+    }
+
+    const fn num_objects(&self) -> usize {
+        ((self.0 & Self::NUM_DATA_OBJ_MASK) >> Self::NUM_DATA_OBJ_OFFSET) as usize
+    }
+
+    pub fn message_type<T: WriteRead + Write>(&self) -> Result<MessageType, Error<T>> {
+        let r#type = self.0 & Self::TYPE_MASK;
+        let num_objects = self.num_objects();
+        defmt::info!("type {}, num objects {}", r#type, num_objects);
+        if num_objects == 0 {
+            let ctrl_message = r#type.try_into().map_err(|_| Error::InvalidHeader)?;
+            Ok(MessageType::ControlMessage(ctrl_message))
+        } else {
+            let data_message = r#type.try_into().map_err(|_| Error::InvalidHeader)?;
+            Ok(MessageType::DataMessage(data_message, num_objects as u16))
+        }
     }
 }
 
@@ -563,7 +731,7 @@ impl SourceCapabilitiesMessage {
 impl Message for SourceCapabilitiesMessage {
     fn get_header(&self) -> MessageHeader {
         let msg_type = MessageType::DataMessage(DataMessageType::SourceCapabilities, 1);
-        MessageHeader::new(msg_type, Some(PortType::DFP), Revision::R1_0, 0)
+        MessageHeader::new(msg_type, Some(PortType::DFP), Revision::R1_0)
     }
 
     fn get_data(&self) -> Vec<u32, MAX_DATA_OBJECTS> {
@@ -571,5 +739,43 @@ impl Message for SourceCapabilitiesMessage {
         let fixed_supply = PowerDataObject::new_fixed_safe5v_0ma();
         objects.push(fixed_supply.0).unwrap();
         objects
+    }
+}
+
+pub struct AcceptMessage {}
+
+impl AcceptMessage {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl Message for AcceptMessage {
+    fn get_header(&self) -> MessageHeader {
+        let msg_type = MessageType::ControlMessage(ControlMessageType::Accept);
+        MessageHeader::new(msg_type, Some(PortType::DFP), Revision::R1_0)
+    }
+
+    fn get_data(&self) -> Vec<u32, MAX_DATA_OBJECTS> {
+        Vec::new()
+    }
+}
+
+pub struct PsRdyMessage {}
+
+impl PsRdyMessage {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl Message for PsRdyMessage {
+    fn get_header(&self) -> MessageHeader {
+        let msg_type = MessageType::ControlMessage(ControlMessageType::PsRdy);
+        MessageHeader::new(msg_type, Some(PortType::DFP), Revision::R1_0)
+    }
+
+    fn get_data(&self) -> Vec<u32, MAX_DATA_OBJECTS> {
+        Vec::new()
     }
 }

@@ -1,6 +1,9 @@
 //! FSM for a USB-C DFP implementation. USB UFP or DRP are not supported supported as of now
 
-use super::fusb302::{self, Fusb302};
+use super::fusb302::{
+    self, AcceptMessage, ControlMessageType, DataMessageType, Fusb302, MessageType, PortType,
+    PsRdyMessage, SopTarget, SourceCapabilitiesMessage,
+};
 
 use embedded_hal::{
     blocking::{
@@ -16,6 +19,7 @@ enum State {
     ApplyVbus,
     SendSourceCapabilities,
     PowerNegotiation,
+    ConfigurePS,
     Connected,
 }
 
@@ -58,9 +62,10 @@ where
     pub fn new(mut pd_controller: Fusb302<T>, irq_pin: U) -> Result<Self, Error<T>> {
         pd_controller.init()?;
         pd_controller.reset_pd()?;
-        pd_controller.configure_port_type(fusb302::PortType::Open)?;
+        pd_controller.configure_port_type(PortType::Open)?;
         pd_controller.enable_interrupts()?;
-        pd_controller.enable_tx_sent_irq()?;
+        pd_controller.configure_tx_sent_irq(true)?;
+        pd_controller.configure_rx_recv_irq(true)?;
 
         Ok(Self {
             pd_controller,
@@ -71,10 +76,11 @@ where
 
     pub fn run<V: DelayUs<u32>>(&mut self, timer: &mut V) -> Result<(), Error<T>> {
         // No interrupts should be received yet, since they are off
-        if self.irq_pin.is_low().unwrap_or(false) {
-            defmt::info!("Irq from fusb302");
-            self.pd_controller.handle_irq()?;
-        }
+        let received_messages = if self.irq_pin.is_low().unwrap_or(false) {
+            self.pd_controller.handle_irq()?
+        } else {
+            false
+        };
 
         match self.current_state {
             State::Disconnected => match self.pd_controller.detect_cc_orientation(timer)? {
@@ -101,29 +107,73 @@ where
                 }
             }
             State::ApplyVbus => {
-                self.pd_controller
-                    .configure_port_type(fusb302::PortType::DFP)?;
+                self.pd_controller.configure_port_type(PortType::DFP)?;
                 // TODO(javier-varez): Enable Vbus here. It's unclear how to do this with the
                 // current design
                 self.trigger_transition(State::SendSourceCapabilities);
             }
             State::SendSourceCapabilities => {
-                let caps = fusb302::SourceCapabilitiesMessage::new_no_capabilities();
-                self.pd_controller
-                    .send_message(fusb302::SopTarget::SOP, &caps)?;
+                if received_messages {
+                    while !self.pd_controller.is_rx_fifo_empty()? {
+                        let (target, header, _objects) = self.pd_controller.receive_message()?;
+                        match (target, header.message_type()?) {
+                            (
+                                SopTarget::SOP,
+                                MessageType::DataMessage(DataMessageType::Request, 1),
+                            ) => {
+                                // TODO(javier-varez): Wait for Ack before transitioning
+                                self.trigger_transition(State::PowerNegotiation);
+                            }
+                            (_, MessageType::ControlMessage(ControlMessageType::GoodCrc)) => {
+                                // Ignore good crc
+                            }
+                            _ => {
+                                // Received unexpected message
+                                defmt::warn!(
+                                    "Received unexpected message in SendSourceCapabilities"
+                                );
+                            }
+                        }
+                    }
+                }
 
-                // TODO(javier-varez): Wait for Ack before transitioning
-                self.trigger_transition(State::PowerNegotiation);
+                let caps = SourceCapabilitiesMessage::new_no_capabilities();
+                match self.pd_controller.send_message(SopTarget::SOP, &caps) {
+                    Err(fusb302::Error::TxInProgress) => {
+                        // Silently ignore these
+                    }
+                    Ok(()) => {}
+                    Err(error) => return Err(Error::DeviceError(error)),
+                };
             }
             State::PowerNegotiation => {
-                // TODO(javier-varez): Wait until the sink sends a request packet and we are ok
-                // with it. Then transition to connected
+                let accept = AcceptMessage::new();
+                match self.pd_controller.send_message(SopTarget::SOP, &accept) {
+                    Err(fusb302::Error::TxInProgress) => {
+                        // Silently ignore these
+                    }
+                    Ok(()) => {
+                        self.trigger_transition(State::ConfigurePS);
+                    }
+                    Err(error) => return Err(Error::DeviceError(error)),
+                };
+            }
+            State::ConfigurePS => {
+                let ps_rdy = PsRdyMessage::new();
+                match self.pd_controller.send_message(SopTarget::SOP, &ps_rdy) {
+                    Err(fusb302::Error::TxInProgress) => {
+                        // Silently ignore these
+                    }
+                    Ok(()) => {
+                        self.trigger_transition(State::Connected);
+                    }
+                    Err(error) => return Err(Error::DeviceError(error)),
+                };
             }
             State::Connected => {
                 if !self.pd_controller.monitor_connection(timer)? {
                     defmt::info!("Device disconnected");
-                    self.pd_controller
-                        .configure_port_type(fusb302::PortType::Open)?;
+                    self.pd_controller.configure_port_type(PortType::Open)?;
                     self.trigger_transition(State::Disconnected);
                 }
             }

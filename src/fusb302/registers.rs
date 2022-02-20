@@ -39,11 +39,17 @@ pub mod maska {
 
 pub mod maskb {
     pub const ADDR: u8 = 0x0F;
+    pub const GCRCSENT: u8 = 1 << 0;
 }
 
 pub mod interrupta {
     pub const ADDR: u8 = 0x3E;
     pub const TX_SENT: u8 = 1 << 2;
+}
+
+pub mod interruptb {
+    pub const ADDR: u8 = 0x3F;
+    pub const GCRCSENT: u8 = 1 << 0;
 }
 
 pub mod control0 {
@@ -90,6 +96,11 @@ pub mod status0 {
     pub const COMP: u8 = 1 << 5;
 }
 
+pub mod status1 {
+    pub const ADDR: u8 = 0x41;
+    pub const RX_EMPTY: u8 = 1 << 5;
+}
+
 pub mod fifo {
     pub const ADDR: u8 = 0x43;
 
@@ -98,7 +109,6 @@ pub mod fifo {
         pub const SYNC1: u8 = 0x12;
         pub const SYNC2: u8 = 0x13;
         pub const SYNC3: u8 = 0x1B;
-        pub const RESET1: u8 = 0x15;
         pub const RESET2: u8 = 0x16;
         pub const PACKSYM: u8 = 0x80;
         pub const JAM_CRC: u8 = 0xFF;
