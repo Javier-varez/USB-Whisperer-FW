@@ -5,7 +5,7 @@ use super::fusb302::{self, Fusb302};
 use embedded_hal::{
     blocking::{
         delay::DelayUs,
-        i2c::{Read, Write},
+        i2c::{Write, WriteRead},
     },
     digital::v2::InputPin,
 };
@@ -21,12 +21,12 @@ enum State {
 
 pub enum Error<T>
 where
-    T: Read + Write,
+    T: WriteRead + Write,
 {
     DeviceError(fusb302::Error<T>),
 }
 
-impl<T: Read + Write> core::fmt::Debug for Error<T> {
+impl<T: WriteRead + Write> core::fmt::Debug for Error<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::DeviceError(inner) => write!(f, "DeviceError({:?})", inner),
@@ -34,7 +34,7 @@ impl<T: Read + Write> core::fmt::Debug for Error<T> {
     }
 }
 
-impl<T: Read + Write> From<fusb302::Error<T>> for Error<T> {
+impl<T: WriteRead + Write> From<fusb302::Error<T>> for Error<T> {
     fn from(error: fusb302::Error<T>) -> Self {
         Self::DeviceError(error)
     }
@@ -42,7 +42,7 @@ impl<T: Read + Write> From<fusb302::Error<T>> for Error<T> {
 
 pub struct UsbFsm<T, U>
 where
-    T: Read + Write,
+    T: WriteRead + Write,
     U: InputPin,
 {
     pd_controller: Fusb302<T>,
@@ -52,7 +52,7 @@ where
 
 impl<T, U> UsbFsm<T, U>
 where
-    T: Read + Write,
+    T: WriteRead + Write,
     U: InputPin,
 {
     pub fn new(mut pd_controller: Fusb302<T>, irq_pin: U) -> Result<Self, Error<T>> {

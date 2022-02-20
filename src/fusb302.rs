@@ -3,18 +3,18 @@ const PD_RETRIES_COUNT: u8 = 3;
 
 mod registers;
 
-use embedded_hal::blocking::i2c::{Read, Write};
+use embedded_hal::blocking::i2c::{Write, WriteRead};
 
 use heapless::Vec;
 
-pub enum Error<T: Read + Write> {
+pub enum Error<T: WriteRead + Write> {
     DeviceNotFound,
-    IOReadError(<T as Read>::Error),
+    IOReadError(<T as WriteRead>::Error),
     IOWriteError(<T as Write>::Error),
     UnknownPolarity,
 }
 
-impl<T: Read + Write> core::fmt::Debug for Error<T> {
+impl<T: WriteRead + Write> core::fmt::Debug for Error<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::IOReadError(_) => write!(f, "IO Error (Read)"),
@@ -38,14 +38,14 @@ pub enum PortType {
     UFP,
 }
 
-pub struct Fusb302<T: Read + Write> {
+pub struct Fusb302<T: WriteRead + Write> {
     i2c_bus: T,
     polarity: Option<CcLine>,
     port_type: PortType,
     current_msg_id: u8,
 }
 
-impl<T: Read + Write> Fusb302<T> {
+impl<T: WriteRead + Write> Fusb302<T> {
     pub fn new(i2c_bus: T) -> Result<Self, Error<T>> {
         // Try to read device ID and verify it is connected, otherwise return an error
 
@@ -308,13 +308,10 @@ impl<T: Read + Write> Fusb302<T> {
 
     fn read_register(&mut self, address: u8) -> Result<u8, Error<T>> {
         let addr_buffer = [address];
-        self.i2c_bus
-            .write(DEVICE_SLAVE_ADDR, &addr_buffer)
-            .map_err(|err| Error::IOWriteError(err))?;
 
         let mut register_value = [0];
         self.i2c_bus
-            .read(DEVICE_SLAVE_ADDR, &mut register_value)
+            .write_read(DEVICE_SLAVE_ADDR, &addr_buffer, &mut register_value)
             .map_err(|err| Error::IOReadError(err))?;
 
         Ok(register_value[0])
