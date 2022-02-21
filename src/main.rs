@@ -21,6 +21,10 @@ fn panic() -> ! {
     cortex_m::asm::udf()
 }
 
+defmt::timestamp!("{=u64:us}", {
+    (system_timer::get_ms().into_ms() as u64) * 1000
+});
+
 /// Terminates the application and makes `probe-run` exit with exit-code = 0
 pub fn exit() -> ! {
     loop {
@@ -62,7 +66,7 @@ fn main() -> ! {
     loop {
         state_machine.run(&mut timer).unwrap();
 
-        timer.delay_us(10_000u32);
+        timer.delay_us(4_000u32);
     }
 }
 

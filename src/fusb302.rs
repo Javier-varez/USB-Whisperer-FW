@@ -13,8 +13,9 @@ pub enum Error<T: WriteRead + Write> {
     IOWriteError(<T as Write>::Error),
     UnknownPolarity,
     InvalidHeader,
-    TxInProgress,
-    ErrorState,
+    TxRetryFailed,
+    SoftResetRequested,
+    HardResetRequested,
 }
 
 impl<T: WriteRead + Write> core::fmt::Debug for Error<T> {
@@ -25,10 +26,17 @@ impl<T: WriteRead + Write> core::fmt::Debug for Error<T> {
             Error::DeviceNotFound => write!(f, "DeviceNotFound"),
             Error::UnknownPolarity => write!(f, "UnknownPolarity"),
             Error::InvalidHeader => write!(f, "InvalidHeader"),
-            Error::TxInProgress => write!(f, "TxInProgress"),
-            Error::ErrorState => write!(f, "ErrorState"),
+            Error::TxRetryFailed => write!(f, "TxRetryFailed"),
+            Error::SoftResetRequested => write!(f, "SoftResetRequested"),
+            Error::HardResetRequested => write!(f, "HardResetRequested"),
         }
     }
+}
+
+#[derive(Default)]
+pub struct InterruptStatus {
+    pub vbus_ok: bool,
+    pub received_messages: bool,
 }
 
 #[derive(defmt::Format, Debug, Clone, Copy, PartialEq)]
@@ -49,7 +57,6 @@ pub struct Fusb302<T: WriteRead + Write> {
     polarity: Option<CcLine>,
     port_type: PortType,
     current_msg_id: u8,
-    tx_in_progress: bool,
 }
 
 impl<T: WriteRead + Write> Fusb302<T> {
@@ -61,7 +68,6 @@ impl<T: WriteRead + Write> Fusb302<T> {
             polarity: None,
             port_type: PortType::Open,
             current_msg_id: 7,
-            tx_in_progress: false,
         };
         let id = instance.read_register(registers::device_id::ADDR)?;
 
@@ -78,12 +84,18 @@ impl<T: WriteRead + Write> Fusb302<T> {
     pub fn init(&mut self) -> Result<(), Error<T>> {
         // Trigger a SW reset
         self.write_register(registers::reset::ADDR, registers::reset::SW_RESET)?;
+        self.current_msg_id = 7;
 
         // Set auto retry and the num_retries to 3
         self.modify_register(registers::control3::ADDR, |value| {
             (value & !registers::control3::N_RETRIES_MASK)
                 | (PD_RETRIES_COUNT << registers::control3::N_RETRIES_OFFSET)
                 | registers::control3::AUTO_RETRY
+        })?;
+
+        self.modify_register(registers::control0::ADDR, |reg| {
+            let off = reg & !registers::control0::HOST_CUR_MASK;
+            off | registers::control0::HOST_CUR_DEF
         })?;
 
         self.write_register(
@@ -93,9 +105,18 @@ impl<T: WriteRead + Write> Fusb302<T> {
                 | registers::control1::RX_FLUSH,
         )?;
 
+        self.modify_register(registers::switches1::ADDR, |reg| {
+            reg | registers::switches1::POWERROLE | registers::switches1::DATAROLE
+        })?;
+
         self.auto_goodcrc_enable(false)?;
 
         self.mask_all_interrutps()?;
+
+        // Unmask soft reset and hard reset
+        self.modify_register(registers::maska::ADDR, |reg| {
+            reg & !(registers::maska::SOFTRST | registers::maska::HARDRST)
+        })?;
 
         // Enable power
         self.write_register(registers::power::ADDR, registers::power::PWR_ALL_MASK)
@@ -137,7 +158,7 @@ impl<T: WriteRead + Write> Fusb302<T> {
     }
 
     pub fn reset_pd(&mut self) -> Result<(), Error<T>> {
-        self.tx_in_progress = false;
+        self.current_msg_id = 7;
         self.write_register(registers::reset::ADDR, registers::reset::PD_RESET)
     }
 
@@ -161,12 +182,18 @@ impl<T: WriteRead + Write> Fusb302<T> {
                     | registers::switches0::CC1_PD_EN);
 
             match (polarity, port_type) {
-                (CcLine::Cc1, PortType::DFP) => open | registers::switches0::CC1_PU_EN,
-                (CcLine::Cc2, PortType::DFP) => open | registers::switches0::CC2_PU_EN,
+                (CcLine::Cc1, PortType::DFP) => {
+                    open | registers::switches0::CC1_PU_EN | registers::switches0::CC2_PU_EN
+                }
+                (CcLine::Cc2, PortType::DFP) => {
+                    open | registers::switches0::CC2_PU_EN | registers::switches0::CC1_PU_EN
+                }
                 (_, PortType::_UFP) => {
                     open | registers::switches0::CC1_PD_EN | registers::switches0::CC2_PD_EN
                 }
-                (_, PortType::Open) => open,
+                (_, PortType::Open) => {
+                    open | registers::switches0::CC1_PU_EN | registers::switches0::CC2_PU_EN
+                }
             }
         })?;
 
@@ -220,6 +247,11 @@ impl<T: WriteRead + Write> Fusb302<T> {
         })
     }
 
+    pub fn get_vbus_state(&mut self) -> Result<bool, Error<T>> {
+        let reg = self.read_register(registers::status0::ADDR)?;
+        Ok((reg & registers::status0::VBUS_OK) != 0)
+    }
+
     pub fn detect_cc_orientation<U>(&mut self, timer: &mut U) -> Result<Option<CcLine>, Error<T>>
     where
         U: embedded_hal::blocking::delay::DelayUs<u32>,
@@ -229,6 +261,7 @@ impl<T: WriteRead + Write> Fusb302<T> {
         let cc2 = self.detect_rd_sink(CcLine::Cc2, timer)?;
 
         if cc1 && cc2 {
+            defmt::warn!("Both CC lines are low!");
             self.polarity = None
         } else if cc1 {
             self.polarity = Some(CcLine::Cc1);
@@ -249,12 +282,13 @@ impl<T: WriteRead + Write> Fusb302<T> {
     where
         U: embedded_hal::blocking::delay::DelayUs<u32>,
     {
+        let saved_switches0 = self.read_register(registers::switches0::ADDR)?;
         self.modify_register(registers::switches0::ADDR, |reg| {
             let open = reg
-                & !(registers::switches0::CC2_PU_EN
-                    | registers::switches0::CC1_PU_EN
-                    | registers::switches0::MEAS_CC1
+                & !(registers::switches0::MEAS_CC1
                     | registers::switches0::MEAS_CC2
+                    | registers::switches0::CC1_PU_EN
+                    | registers::switches0::CC2_PU_EN
                     | registers::switches0::CC1_PD_EN
                     | registers::switches0::CC2_PD_EN);
 
@@ -268,7 +302,10 @@ impl<T: WriteRead + Write> Fusb302<T> {
             }
         })?;
 
-        self.monitor_connection(timer)
+        let detected = self.monitor_connection(timer)?;
+
+        self.write_register(registers::switches0::ADDR, saved_switches0)?;
+        Ok(detected)
     }
 
     pub fn monitor_connection<U>(&mut self, timer: &mut U) -> Result<bool, Error<T>>
@@ -372,6 +409,16 @@ impl<T: WriteRead + Write> Fusb302<T> {
         Ok(())
     }
 
+    pub fn configure_vbus_irq(&mut self, enable: bool) -> Result<(), Error<T>> {
+        self.modify_register(registers::mask::ADDR, |reg| {
+            if enable {
+                reg & !(registers::mask::VBUS_OK)
+            } else {
+                reg | registers::mask::VBUS_OK
+            }
+        })
+    }
+
     pub fn configure_tx_sent_irq(&mut self, enable: bool) -> Result<(), Error<T>> {
         self.modify_register(registers::maska::ADDR, |reg| {
             if enable {
@@ -402,23 +449,19 @@ impl<T: WriteRead + Write> Fusb302<T> {
         })
     }
 
-    pub fn handle_irq(&mut self) -> Result<bool, Error<T>> {
+    pub fn handle_irq(&mut self) -> Result<InterruptStatus, Error<T>> {
         let mut received_messages = false;
+        let mut vbus_ok = false;
 
+        let irq = self.read_register(registers::interrupt::ADDR)?;
         let irqa = self.read_register(registers::interrupta::ADDR)?;
         let irqb = self.read_register(registers::interruptb::ADDR)?;
+        defmt::dbg!("irq 0x{:x}", irq);
         defmt::dbg!("irqa 0x{:x}", irqa);
         defmt::dbg!("irqb 0x{:x}", irqb);
 
-        if (irqa & registers::interrupta::RETRYFAIL) != 0 {
-            defmt::error!("Device in error state. Retries failed.");
-            self.tx_in_progress = false;
-            // return Err(Error::ErrorState);
-        }
-
         if (irqa & registers::interrupta::TX_SENT) != 0 {
             defmt::info!("TX Sent IRQ received");
-            self.tx_in_progress = false;
         }
 
         if (irqb & registers::interruptb::GCRCSENT) != 0 {
@@ -426,7 +469,23 @@ impl<T: WriteRead + Write> Fusb302<T> {
             received_messages = true;
         }
 
-        Ok(received_messages)
+        if (irqa & registers::interrupta::HARDRST) != 0 {
+            return Err(Error::HardResetRequested);
+        }
+
+        if (irqa & registers::interrupta::SOFTRST) != 0 {
+            return Err(Error::SoftResetRequested);
+        }
+
+        if (irq & registers::interrupt::VBUS_OK) != 0 {
+            defmt::info!("VBUS ok irq");
+            vbus_ok = true;
+        }
+
+        Ok(InterruptStatus {
+            vbus_ok,
+            received_messages,
+        })
     }
 
     pub fn send_hard_reset(&mut self) -> Result<(), Error<T>> {
@@ -440,10 +499,6 @@ impl<T: WriteRead + Write> Fusb302<T> {
         message: &dyn Message,
     ) -> Result<(), Error<T>> {
         const MAX_MSG_SIZE: usize = 42;
-
-        if self.tx_in_progress {
-            return Err(Error::TxInProgress);
-        }
 
         let mut header = message.get_header();
         let objects = message.get_data();
@@ -494,13 +549,45 @@ impl<T: WriteRead + Write> Fusb302<T> {
 
         self.i2c_bus
             .write(DEVICE_SLAVE_ADDR, &buffer)
-            .map_err(|err| Error::IOWriteError(err))?;
+            .map_err(|err| Error::IOWriteError(err))
 
-        self.tx_in_progress = true;
-        Ok(())
+        // match self.wait_tx_done() {
+        //     Err(Error::TxRetryFailed) => {
+        //         // We didn't actually send the message so need to handle it here
+        //         if self.current_msg_id == 0 {
+        //             self.current_msg_id = 7;
+        //         } else {
+        //             self.current_msg_id -= 1;
+        //         }
+        //         Err(Error::TxRetryFailed)
+        //     }
+        //     val => val,
+        // }
+    }
 
-        // TODO(javier-varez): Could make this (or a variant) blocking so that we don't have to
-        // wait externally...
+    fn wait_tx_done(&mut self) -> Result<(), Error<T>> {
+        loop {
+            let status0a = self.read_register(registers::status0a::ADDR)?;
+            if (status0a & registers::status0a::RETRYFAIL) != 0 {
+                return Err(Error::TxRetryFailed);
+            }
+
+            if (status0a & registers::status0a::SOFTRST) != 0 {
+                return Err(Error::SoftResetRequested);
+            }
+
+            if (status0a & registers::status0a::HARDRST) != 0 {
+                return Err(Error::HardResetRequested);
+            }
+
+            let irqa = self.read_register(registers::interrupta::ADDR)?;
+            if (irqa & registers::interrupta::TX_SENT) != 0 {
+                defmt::info!("Message sent blocking");
+                // Read GoodCrc from fifo
+                self.receive_message()?;
+                return Ok(());
+            }
+        }
     }
 
     pub fn is_rx_fifo_empty(&mut self) -> Result<bool, Error<T>> {
@@ -523,7 +610,7 @@ impl<T: WriteRead + Write> Fusb302<T> {
         let msg_type = header.message_type()?;
         let sop_target = match token_and_header[0] & registers::fifo::rx_tokens::MASK {
             registers::fifo::rx_tokens::SOP => {
-                defmt::info!("SOP recv {}", msg_type);
+                defmt::error!("SOP recv {}", msg_type);
                 SopTarget::SOP
             }
             registers::fifo::rx_tokens::SOP1 => {
@@ -539,7 +626,7 @@ impl<T: WriteRead + Write> Fusb302<T> {
                 SopTarget::SOP1DB
             }
             registers::fifo::rx_tokens::SOP2DB => {
-                defmt::info!("SOP''Debug recv {}", msg_type);
+                defmt::error!("SOP''Debug recv {}", msg_type);
                 SopTarget::SOP2DB
             }
             _ => panic!("Unknown packet received {:?}", msg_type),
@@ -557,13 +644,11 @@ impl<T: WriteRead + Write> Fusb302<T> {
             .write_read(DEVICE_SLAVE_ADDR, &reg_addr, &mut raw_objects)
             .map_err(|err| Error::IOReadError(err))?;
 
-        defmt::info!("Objects = {:?}", &raw_objects[..]);
-
         Ok((sop_target, header, raw_objects))
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, defmt::Format)]
 pub enum SopTarget {
     SOP,
     SOP1,
@@ -694,9 +779,10 @@ pub enum MessageType {
 #[repr(u16)]
 enum Revision {
     R1_0 = 0b00,
-    _R2_0 = 0b01,
+    R2_0 = 0b01,
 }
 
+#[derive(defmt::Format)]
 pub struct MessageHeader(u16);
 
 impl MessageHeader {
@@ -748,7 +834,6 @@ impl MessageHeader {
     pub fn message_type<T: WriteRead + Write>(&self) -> Result<MessageType, Error<T>> {
         let r#type = self.0 & Self::TYPE_MASK;
         let num_objects = self.num_objects();
-        defmt::info!("type {}, num objects {}", r#type, num_objects);
         if num_objects == 0 {
             let ctrl_message = r#type.try_into().map_err(|_| Error::InvalidHeader)?;
             Ok(MessageType::ControlMessage(ctrl_message))
@@ -762,36 +847,53 @@ impl MessageHeader {
 struct PowerDataObject(u32);
 
 impl PowerDataObject {
-    fn new_fixed_safe5v_0ma() -> Self {
+    fn new_fixed_safe5v(current_ma: u32) -> Self {
         const FIXED_VOLTAGE_OFFSET: usize = 10;
         const VOLTAGE_LSB_MV: u32 = 50;
 
         const VSAFE5V_MV: u32 = 5000;
 
-        let voltage = (VSAFE5V_MV / VOLTAGE_LSB_MV) << FIXED_VOLTAGE_OFFSET;
+        const MAX_CURRENT_OFFSET: usize = 0;
+        const MAX_CURRENT_LSB_MA: u32 = 10;
+
+        let current_code = current_ma / MAX_CURRENT_LSB_MA;
+
+        let voltage = ((VSAFE5V_MV / VOLTAGE_LSB_MV) << FIXED_VOLTAGE_OFFSET)
+            | (current_code << MAX_CURRENT_OFFSET)
+            | (1 << 26); // Usb comms capable
+                         // | (1 << 28)  // Usb suspend
+                         // | (1 << 29)  // Usb DRP
+                         // | (1 << 25); // Usb DRD
 
         Self(voltage)
     }
 }
 
 // TODO(javier-varez): Add support to other supplies when we have them.
-pub struct SourceCapabilitiesMessage {}
+pub struct SourceCapabilitiesMessage {
+    current_ma: u32,
+}
 
 impl SourceCapabilitiesMessage {
     pub const fn new_no_capabilities() -> Self {
-        Self {}
+        Self { current_ma: 0 }
+    }
+
+    pub fn set_fixed_current(&mut self, ma: u32) {
+        self.current_ma = ma;
     }
 }
 
 impl Message for SourceCapabilitiesMessage {
     fn get_header(&self) -> MessageHeader {
         let msg_type = MessageType::DataMessage(DataMessageType::SourceCapabilities, 1);
-        MessageHeader::new(msg_type, Some(PortType::DFP), Revision::R1_0)
+        let header = MessageHeader::new(msg_type, Some(PortType::DFP), Revision::R2_0);
+        header
     }
 
     fn get_data(&self) -> Vec<u32, MAX_DATA_OBJECTS> {
         let mut objects = Vec::new();
-        let fixed_supply = PowerDataObject::new_fixed_safe5v_0ma();
+        let fixed_supply = PowerDataObject::new_fixed_safe5v(self.current_ma);
         objects.push(fixed_supply.0).unwrap();
         objects
     }
@@ -808,7 +910,8 @@ impl AcceptMessage {
 impl Message for AcceptMessage {
     fn get_header(&self) -> MessageHeader {
         let msg_type = MessageType::ControlMessage(ControlMessageType::Accept);
-        MessageHeader::new(msg_type, Some(PortType::DFP), Revision::R1_0)
+        let header = MessageHeader::new(msg_type, Some(PortType::DFP), Revision::R2_0);
+        header
     }
 
     fn get_data(&self) -> Vec<u32, MAX_DATA_OBJECTS> {
@@ -827,10 +930,51 @@ impl PsRdyMessage {
 impl Message for PsRdyMessage {
     fn get_header(&self) -> MessageHeader {
         let msg_type = MessageType::ControlMessage(ControlMessageType::PsRdy);
-        MessageHeader::new(msg_type, Some(PortType::DFP), Revision::R1_0)
+        let header = MessageHeader::new(msg_type, Some(PortType::DFP), Revision::R2_0);
+        header
     }
 
     fn get_data(&self) -> Vec<u32, MAX_DATA_OBJECTS> {
         Vec::new()
+    }
+}
+
+pub struct StructuredVdmMessage {
+    vdm_header: u32,
+    objects: Vec<u32, { MAX_DATA_OBJECTS - 1 }>,
+}
+
+impl StructuredVdmMessage {
+    pub fn new(svid: u16, command: u16, objects: &[u32]) -> Self {
+        let vdm_header = ((svid as u32) << 16) | 0x8000 | (command as u32);
+        let mut vector: Vec<u32, { MAX_DATA_OBJECTS - 1 }> = Vec::new();
+        for object in objects {
+            vector.push(*object).unwrap();
+        }
+
+        Self {
+            vdm_header,
+            objects: vector,
+        }
+    }
+}
+
+impl Message for StructuredVdmMessage {
+    fn get_header(&self) -> MessageHeader {
+        let msg_type = MessageType::DataMessage(
+            DataMessageType::VendorDefined,
+            1 + self.objects.len() as u16,
+        );
+        MessageHeader::new(msg_type, Some(PortType::DFP), Revision::R2_0)
+    }
+
+    fn get_data(&self) -> Vec<u32, MAX_DATA_OBJECTS> {
+        let mut vector = Vec::new();
+
+        vector.push(self.vdm_header).unwrap();
+        for object in &self.objects {
+            vector.push(*object).unwrap();
+        }
+        vector
     }
 }

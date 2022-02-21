@@ -26,16 +26,21 @@ pub mod switches1 {
     pub const SPECREV_MASK: u8 = 0x03 << 5;
     pub const TXCC1_EN: u8 = 1 << 0;
     pub const TXCC2_EN: u8 = 1 << 1;
+    pub const POWERROLE: u8 = 1 << 7;
+    pub const DATAROLE: u8 = 1 << 4;
 }
 
 pub mod mask {
     pub const ADDR: u8 = 0x0A;
+    pub const VBUS_OK: u8 = 1 << 7;
 }
 
 pub mod maska {
     pub const ADDR: u8 = 0x0E;
     pub const TX_SENT: u8 = 1 << 2;
     pub const RETRYFAIL: u8 = 1 << 4;
+    pub const SOFTRST: u8 = 1 << 1;
+    pub const HARDRST: u8 = 1 << 0;
 }
 
 pub mod maskb {
@@ -45,12 +50,15 @@ pub mod maskb {
 
 pub mod interrupt {
     pub const ADDR: u8 = 0x42;
+    pub const VBUS_OK: u8 = 1 << 7;
 }
 
 pub mod interrupta {
     pub const ADDR: u8 = 0x3E;
     pub const TX_SENT: u8 = 1 << 2;
     pub const RETRYFAIL: u8 = 1 << 4;
+    pub const SOFTRST: u8 = 1 << 1;
+    pub const HARDRST: u8 = 1 << 0;
 }
 
 pub mod interruptb {
@@ -62,6 +70,8 @@ pub mod control0 {
     pub const ADDR: u8 = 0x06;
     pub const INT_MASK: u8 = 1 << 5;
     pub const TX_FLUSH: u8 = 1 << 6;
+    pub const HOST_CUR_MASK: u8 = 3 << 2;
+    pub const HOST_CUR_DEF: u8 = 1 << 2;
 }
 
 pub mod control1 {
@@ -102,6 +112,7 @@ pub mod measure {
 pub mod status0 {
     pub const ADDR: u8 = 0x40;
     pub const COMP: u8 = 1 << 5;
+    pub const VBUS_OK: u8 = 1 << 7;
 }
 
 pub mod status1 {
@@ -111,6 +122,9 @@ pub mod status1 {
 
 pub mod status0a {
     pub const ADDR: u8 = 0x3c;
+    pub const RETRYFAIL: u8 = 1 << 4;
+    pub const SOFTRST: u8 = 1 << 1;
+    pub const HARDRST: u8 = 1 << 0;
 }
 
 pub mod status1a {
