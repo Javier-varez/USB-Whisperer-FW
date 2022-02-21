@@ -27,7 +27,6 @@ enum State {
     Connected,
     RecoverError,
     WaitRecovery,
-    SendVdm,
 }
 
 pub enum Error<T>
@@ -101,21 +100,20 @@ where
         }
     }
 
-    fn send_message_ignore_retry_fail(
-        &mut self,
-        sop_target: SopTarget,
-        message: &dyn Message,
-    ) -> Result<(), Error<T>> {
-        match self.pd_controller.send_message(sop_target, message) {
-            Err(fusb302::Error::TxRetryFailed) => Ok(()),
-            val => val,
-        }?;
-        Ok(())
-    }
     pub fn run<V: DelayUs<u32>>(&mut self, timer: &mut V) -> Result<(), Error<T>> {
         match self.run_inner(timer) {
             Err(Error::DeviceError(fusb302::Error::HardResetRequested)) => {
                 defmt::error!("Hard reset requested");
+                self.trigger_transition(State::RecoverError);
+                Ok(())
+            }
+            Err(Error::DeviceError(fusb302::Error::SoftResetRequested)) => {
+                defmt::error!("Soft reset requested");
+                self.trigger_transition(State::RecoverError);
+                Ok(())
+            }
+            Err(Error::DeviceError(fusb302::Error::TxRetryFailed)) => {
+                defmt::error!("Max retries reached");
                 self.trigger_transition(State::RecoverError);
                 Ok(())
             }
@@ -142,9 +140,9 @@ where
 
         if vbus_ok {
             if self.pd_controller.get_vbus_state()? {
-                defmt::info!("VBUS high");
+                defmt::dbg!("VBUS high");
             } else {
-                defmt::info!("VBUS low");
+                defmt::dbg!("VBUS low");
                 if matches!(
                     self.current_state,
                     State::SendSourceCapabilities
@@ -152,7 +150,6 @@ where
                         | State::PowerNegotiation
                         | State::ConfigurePS
                         | State::Connected
-                        | State::SendVdm
                 ) {
                     self.vbus_pin.set_low().unwrap_or_default();
                     self.pd_controller.configure_port_type(PortType::Open)?;
@@ -165,7 +162,7 @@ where
             State::Disconnected => {
                 match self.pd_controller.detect_cc_orientation(timer)? {
                     Some(orientation) => {
-                        defmt::info!("Detected line {}", orientation);
+                        defmt::dbg!("Detected line {}", orientation);
                         self.trigger_transition(State::DebounceConnection);
                     }
                     None => {}
@@ -202,7 +199,7 @@ where
                 }
 
                 if self.elapsed_since_entry().into_ms() > 100 {
-                    defmt::warn!("timeout waiting for vbus to be enabled");
+                    defmt::warn!("Timeout waiting for vbus to be enabled");
                     self.trigger_transition(State::RecoverError);
                 }
             }
@@ -216,12 +213,12 @@ where
                         Ok(())
                     }
                     Ok(false) => Ok(()),
-                    Err(Error::DeviceError(fusb302::Error::TxRetryFailed)) => Ok(()),
+                    Err(Error::DeviceError(fusb302::Error::TxAlreadyInProgress)) => Ok(()),
                     Err(err) => Err(err),
                 }?;
 
                 if self.elapsed_since_entry().into_ms() > 2000 {
-                    defmt::warn!("No request, giving up");
+                    defmt::warn!("Could not send capabilities, giving up");
                     self.trigger_transition(State::RecoverError);
                 }
             }
@@ -263,13 +260,13 @@ where
                         Ok(())
                     }
                     Ok(false) => Ok(()),
-                    Err(Error::DeviceError(fusb302::Error::TxRetryFailed)) => Ok(()),
+                    Err(Error::DeviceError(fusb302::Error::TxAlreadyInProgress)) => Ok(()),
                     Err(err) => Err(err),
                 }?;
 
                 // Timeout after 2 s
                 if self.elapsed_since_entry().into_ms() > 2000 {
-                    defmt::warn!("No response to capabilities request, giving up");
+                    defmt::warn!("Accept message not sent, giving up");
                     self.trigger_transition(State::RecoverError);
                 }
             }
@@ -281,13 +278,13 @@ where
                         Ok(())
                     }
                     Ok(false) => Ok(()),
-                    Err(Error::DeviceError(fusb302::Error::TxRetryFailed)) => Ok(()),
+                    Err(Error::DeviceError(fusb302::Error::TxAlreadyInProgress)) => Ok(()),
                     Err(err) => Err(err),
                 }?;
 
                 // Timeout after 2 s
                 if self.elapsed_since_entry().into_ms() > 2000 {
-                    defmt::warn!("No response to capabilities request, giving up");
+                    defmt::warn!("PS Rdy not sent, giving up");
                     self.trigger_transition(State::RecoverError);
                 }
             }
@@ -299,22 +296,16 @@ where
                     self.trigger_transition(State::WaitRecovery);
                 }
 
-                if self.elapsed_since_entry().into_ms() > 5000 {
-                    self.trigger_transition(State::SendVdm);
-                }
+                // Send reboot order as test
+                let vdm_message =
+                    fusb302::StructuredVdmMessage::new(0x5ac, 0x12, &[0x0105, 0x80000000]);
+                self.send_with_interval(SopTarget::SOP2DB, &vdm_message, 2000)?;
 
                 if received_messages {
                     while !self.pd_controller.is_rx_fifo_empty()? {
                         let (_target, _header, _objects) = self.pd_controller.receive_message()?;
                     }
                 }
-            }
-            State::SendVdm => {
-                // reboot order
-                let vdm_message =
-                    fusb302::StructuredVdmMessage::new(0x5ac, 0x12, &[0x0105, 0x80000000]);
-                self.send_message_ignore_retry_fail(SopTarget::SOP2DB, &vdm_message)?;
-                self.trigger_transition(State::Connected);
             }
             State::RecoverError => {
                 // self.pd_controller.print_status_regs()?;

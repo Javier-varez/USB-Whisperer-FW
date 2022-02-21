@@ -14,6 +14,7 @@ pub enum Error<T: WriteRead + Write> {
     UnknownPolarity,
     InvalidHeader,
     TxRetryFailed,
+    TxAlreadyInProgress,
     SoftResetRequested,
     HardResetRequested,
 }
@@ -27,6 +28,7 @@ impl<T: WriteRead + Write> core::fmt::Debug for Error<T> {
             Error::UnknownPolarity => write!(f, "UnknownPolarity"),
             Error::InvalidHeader => write!(f, "InvalidHeader"),
             Error::TxRetryFailed => write!(f, "TxRetryFailed"),
+            Error::TxAlreadyInProgress => write!(f, "TxAlreadyInProgress"),
             Error::SoftResetRequested => write!(f, "SoftResetRequested"),
             Error::HardResetRequested => write!(f, "HardResetRequested"),
         }
@@ -56,6 +58,7 @@ pub struct Fusb302<T: WriteRead + Write> {
     i2c_bus: T,
     polarity: Option<CcLine>,
     port_type: PortType,
+    tx_in_progress: bool,
     current_msg_id: u8,
 }
 
@@ -67,6 +70,7 @@ impl<T: WriteRead + Write> Fusb302<T> {
             i2c_bus,
             polarity: None,
             port_type: PortType::Open,
+            tx_in_progress: false,
             current_msg_id: 7,
         };
         let id = instance.read_register(registers::device_id::ADDR)?;
@@ -84,6 +88,7 @@ impl<T: WriteRead + Write> Fusb302<T> {
     pub fn init(&mut self) -> Result<(), Error<T>> {
         // Trigger a SW reset
         self.write_register(registers::reset::ADDR, registers::reset::SW_RESET)?;
+        self.tx_in_progress = false;
         self.current_msg_id = 7;
 
         // Set auto retry and the num_retries to 3
@@ -118,37 +123,10 @@ impl<T: WriteRead + Write> Fusb302<T> {
             reg & !(registers::maska::SOFTRST | registers::maska::HARDRST)
         })?;
 
+        self.configure_retry_fail_irq(true)?;
+
         // Enable power
         self.write_register(registers::power::ADDR, registers::power::PWR_ALL_MASK)
-    }
-
-    pub fn flush_fifo(&mut self) -> Result<(), Error<T>> {
-        self.modify_register(registers::control1::ADDR, |reg| {
-            reg | registers::control1::RX_FLUSH
-        })?;
-
-        self.modify_register(registers::control0::ADDR, |reg| {
-            reg | registers::control0::TX_FLUSH
-        })
-    }
-
-    pub fn print_status_regs(&mut self) -> Result<(), Error<T>> {
-        let status0 = self.read_register(registers::status0::ADDR)?;
-        let status1 = self.read_register(registers::status1::ADDR)?;
-        let status0a = self.read_register(registers::status0a::ADDR)?;
-        let status1a = self.read_register(registers::status1a::ADDR)?;
-        let interrupt = self.read_register(registers::interrupt::ADDR)?;
-        let interrupta = self.read_register(registers::interrupta::ADDR)?;
-        let interruptb = self.read_register(registers::interruptb::ADDR)?;
-
-        defmt::error!("status0 = 0x{:x}", status0);
-        defmt::error!("status1 = 0x{:x}", status1);
-        defmt::error!("status0a = 0x{:x}", status0a);
-        defmt::error!("status1a = 0x{:x}", status1a);
-        defmt::error!("interrupt = 0x{:x}", interrupt);
-        defmt::error!("interrupta = 0x{:x}", interrupta);
-        defmt::error!("interruptb = 0x{:x}", interruptb);
-        Ok(())
     }
 
     fn mask_all_interrutps(&mut self) -> Result<(), Error<T>> {
@@ -158,6 +136,7 @@ impl<T: WriteRead + Write> Fusb302<T> {
     }
 
     pub fn reset_pd(&mut self) -> Result<(), Error<T>> {
+        self.tx_in_progress = false;
         self.current_msg_id = 7;
         self.write_register(registers::reset::ADDR, registers::reset::PD_RESET)
     }
@@ -347,7 +326,7 @@ impl<T: WriteRead + Write> Fusb302<T> {
             return Ok(true);
         }
 
-        defmt::info!("Ra detected, is your cable an active cable?");
+        defmt::warn!("Ra detected, is your cable an active cable?");
         Ok(false)
     }
 
@@ -358,8 +337,6 @@ impl<T: WriteRead + Write> Fusb302<T> {
 
     fn auto_goodcrc_enable(&mut self, enable: bool) -> Result<(), Error<T>> {
         self.modify_register(registers::switches1::ADDR, |reg| {
-            // Clear the spec rev. defaults are wrong
-            let reg = reg & !registers::switches1::SPECREV_MASK;
             if enable {
                 reg | registers::switches1::AUTO_CRC
             } else {
@@ -439,7 +416,7 @@ impl<T: WriteRead + Write> Fusb302<T> {
         })
     }
 
-    pub fn configure_retry_fail_irq(&mut self, enable: bool) -> Result<(), Error<T>> {
+    fn configure_retry_fail_irq(&mut self, enable: bool) -> Result<(), Error<T>> {
         self.modify_register(registers::maska::ADDR, |reg| {
             if enable {
                 reg & !(registers::maska::RETRYFAIL)
@@ -470,11 +447,18 @@ impl<T: WriteRead + Write> Fusb302<T> {
         }
 
         if (irqa & registers::interrupta::HARDRST) != 0 {
+            self.tx_in_progress = false;
             return Err(Error::HardResetRequested);
         }
 
         if (irqa & registers::interrupta::SOFTRST) != 0 {
+            self.tx_in_progress = false;
             return Err(Error::SoftResetRequested);
+        }
+
+        if (irqa & registers::interrupta::RETRYFAIL) != 0 {
+            self.tx_in_progress = false;
+            return Err(Error::TxRetryFailed);
         }
 
         if (irq & registers::interrupt::VBUS_OK) != 0 {
@@ -499,6 +483,10 @@ impl<T: WriteRead + Write> Fusb302<T> {
         message: &dyn Message,
     ) -> Result<(), Error<T>> {
         const MAX_MSG_SIZE: usize = 42;
+
+        if self.tx_in_progress {
+            return Err(Error::TxAlreadyInProgress);
+        }
 
         let mut header = message.get_header();
         let objects = message.get_data();
@@ -550,44 +538,6 @@ impl<T: WriteRead + Write> Fusb302<T> {
         self.i2c_bus
             .write(DEVICE_SLAVE_ADDR, &buffer)
             .map_err(|err| Error::IOWriteError(err))
-
-        // match self.wait_tx_done() {
-        //     Err(Error::TxRetryFailed) => {
-        //         // We didn't actually send the message so need to handle it here
-        //         if self.current_msg_id == 0 {
-        //             self.current_msg_id = 7;
-        //         } else {
-        //             self.current_msg_id -= 1;
-        //         }
-        //         Err(Error::TxRetryFailed)
-        //     }
-        //     val => val,
-        // }
-    }
-
-    fn wait_tx_done(&mut self) -> Result<(), Error<T>> {
-        loop {
-            let status0a = self.read_register(registers::status0a::ADDR)?;
-            if (status0a & registers::status0a::RETRYFAIL) != 0 {
-                return Err(Error::TxRetryFailed);
-            }
-
-            if (status0a & registers::status0a::SOFTRST) != 0 {
-                return Err(Error::SoftResetRequested);
-            }
-
-            if (status0a & registers::status0a::HARDRST) != 0 {
-                return Err(Error::HardResetRequested);
-            }
-
-            let irqa = self.read_register(registers::interrupta::ADDR)?;
-            if (irqa & registers::interrupta::TX_SENT) != 0 {
-                defmt::info!("Message sent blocking");
-                // Read GoodCrc from fifo
-                self.receive_message()?;
-                return Ok(());
-            }
-        }
     }
 
     pub fn is_rx_fifo_empty(&mut self) -> Result<bool, Error<T>> {
@@ -607,10 +557,12 @@ impl<T: WriteRead + Write> Fusb302<T> {
             (token_and_header[1] as u16) | ((token_and_header[2] as u16) << 8),
         );
 
+        defmt::info!("header {}", header.0);
+
         let msg_type = header.message_type()?;
         let sop_target = match token_and_header[0] & registers::fifo::rx_tokens::MASK {
             registers::fifo::rx_tokens::SOP => {
-                defmt::error!("SOP recv {}", msg_type);
+                defmt::info!("SOP recv {}", msg_type);
                 SopTarget::SOP
             }
             registers::fifo::rx_tokens::SOP1 => {
@@ -626,7 +578,7 @@ impl<T: WriteRead + Write> Fusb302<T> {
                 SopTarget::SOP1DB
             }
             registers::fifo::rx_tokens::SOP2DB => {
-                defmt::error!("SOP''Debug recv {}", msg_type);
+                defmt::info!("SOP''Debug recv {}", msg_type);
                 SopTarget::SOP2DB
             }
             _ => panic!("Unknown packet received {:?}", msg_type),
@@ -760,7 +712,7 @@ impl TryFrom<u16> for DataMessageType {
             2 => Ok(DataMessageType::Request),
             3 => Ok(DataMessageType::BIST),
             4 => Ok(DataMessageType::SinkCapabilities),
-            5 => Ok(DataMessageType::VendorDefined),
+            15 => Ok(DataMessageType::VendorDefined),
             _ => Err(()),
         }
     }
@@ -778,7 +730,7 @@ pub enum MessageType {
 #[derive(Clone, Copy, Debug)]
 #[repr(u16)]
 enum Revision {
-    R1_0 = 0b00,
+    _R1_0 = 0b00,
     R2_0 = 0b01,
 }
 
