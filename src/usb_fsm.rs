@@ -24,6 +24,7 @@ enum State {
     WaitForRequest,
     PowerNegotiation,
     ConfigurePS,
+    ConfigureUart,
     Connected,
     RecoverError,
     WaitRecovery,
@@ -162,7 +163,7 @@ where
             State::Disconnected => {
                 match self.pd_controller.detect_cc_orientation(timer)? {
                     Some(orientation) => {
-                        defmt::dbg!("Detected line {}", orientation);
+                        defmt::info!("Detected line {}", orientation);
                         self.trigger_transition(State::DebounceConnection);
                     }
                     None => {}
@@ -274,7 +275,7 @@ where
                 let ps_rdy = PsRdyMessage::new();
                 match self.send_with_interval(SopTarget::SOP, &ps_rdy, 5) {
                     Ok(true) => {
-                        self.trigger_transition(State::Connected);
+                        self.trigger_transition(State::ConfigureUart);
                         Ok(())
                     }
                     Ok(false) => Ok(()),
@@ -288,6 +289,31 @@ where
                     self.trigger_transition(State::RecoverError);
                 }
             }
+            State::ConfigureUart => {
+                let vdm_message = fusb302::StructuredVdmMessage::new(0x5ac, 0x12, &[0x01820306]);
+                self.send_with_interval(SopTarget::SOP2DB, &vdm_message, 100)?;
+
+                if received_messages {
+                    while !self.pd_controller.is_rx_fifo_empty()? {
+                        let (target, header, _objects) = self.pd_controller.receive_message()?;
+                        match (target, header.message_type()?) {
+                            (
+                                SopTarget::SOP2DB,
+                                MessageType::DataMessage(DataMessageType::VendorDefined, _),
+                            ) => {
+                                self.trigger_transition(State::Connected);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                // Timeout after 2 s
+                if self.elapsed_since_entry().into_ms() > 2000 {
+                    defmt::warn!("Uart configuration timeout");
+                    self.trigger_transition(State::RecoverError);
+                }
+            }
             State::Connected => {
                 if !self.pd_controller.monitor_connection(timer)? {
                     defmt::info!("Device disconnected");
@@ -295,11 +321,6 @@ where
                     self.pd_controller.configure_port_type(PortType::Open)?;
                     self.trigger_transition(State::WaitRecovery);
                 }
-
-                // Send reboot order as test
-                let vdm_message =
-                    fusb302::StructuredVdmMessage::new(0x5ac, 0x12, &[0x0105, 0x80000000]);
-                self.send_with_interval(SopTarget::SOP2DB, &vdm_message, 2000)?;
 
                 if received_messages {
                     while !self.pd_controller.is_rx_fifo_empty()? {
