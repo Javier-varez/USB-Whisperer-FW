@@ -9,6 +9,8 @@ authors = ["Javier Alvarez <javier.alvarez@allthingsembedded.net>"]
 [dependencies]
 cortex-m = "0.7.4"
 cortex-m-rt = "0.7.1"
+cortex-m-rtic = "1.0.0"
+systick-monotonic = "1.0.0"
 defmt = "0.3.0"
 defmt-rtt = "0.3.1"
 panic-probe = { version = "0.3.0", features = ["print-defmt"] }

@@ -76,7 +76,7 @@ where
             pd_controller,
             irq_pin,
             vbus_pin,
-            current_state: State::Disconnected,
+            current_state: State::RecoverError,
             entry_time: system_timer::get_ms(),
             interval_time: system_timer::get_ms(),
         };
@@ -335,8 +335,6 @@ where
                 self.pd_controller.send_hard_reset()?;
                 self.reinit()?;
 
-                system_timer::blocking_wait_ms(10);
-
                 self.trigger_transition(State::WaitRecovery);
             }
             State::WaitRecovery => {
@@ -361,7 +359,6 @@ where
     fn reinit(&mut self) -> Result<(), Error<T>> {
         self.pd_controller.init()?;
         self.pd_controller.reset_pd()?;
-        system_timer::blocking_wait_ms(10);
         self.pd_controller.configure_port_type(PortType::Open)?;
         self.pd_controller.enable_interrupts()?;
         self.pd_controller.configure_tx_sent_irq(true)?;
