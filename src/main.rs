@@ -22,27 +22,43 @@ pub fn exit() -> ! {
     }
 }
 
-#[rtic::app(device = nrf52840_hal::pac, dispatchers = [NFCT])]
+#[rtic::app(device = nrf52840_hal::pac, dispatchers = [NFCT, USBD])]
 mod app {
     use super::{fusb302, usb_fsm};
     use nrf52840_hal::{self as hal, gpiote::Gpiote};
     use systick_monotonic::*;
 
     use hal::{
+        clocks,
         gpio::{Input, Output, Pin, PullUp, PushPull},
         pac::{TIMER0, TWIM0},
         timer::Timer,
         Twim,
     };
 
+    use usb_device::prelude::*;
+    use usbd_serial::SerialPort;
+
     defmt::timestamp!("{=u64:us}", { monotonics::now().ticks() * 1000 });
+
+    // Type shorthands
+    type Clocks =
+        clocks::Clocks<clocks::ExternalOscillator, clocks::Internal, clocks::LfOscStopped>;
+    type UsbBus =
+        usb_device::bus::UsbBusAllocator<hal::usbd::Usbd<hal::usbd::UsbPeripheral<'static>>>;
+    type UsbSerial = SerialPort<'static, hal::usbd::Usbd<hal::usbd::UsbPeripheral<'static>>>;
+    type UsbDevice =
+        usb_device::device::UsbDevice<'static, hal::usbd::Usbd<hal::usbd::UsbPeripheral<'static>>>;
+    type UsbFsm = usb_fsm::UsbFsm<Twim<TWIM0>, Pin<Input<PullUp>>, Pin<Output<PushPull>>>;
 
     // Local resources to specific tasks (cannot be shared)
     #[local]
     struct Local {
-        state_machine: usb_fsm::UsbFsm<Twim<TWIM0>, Pin<Input<PullUp>>, Pin<Output<PushPull>>>,
+        state_machine: UsbFsm,
         timer: Timer<TIMER0>,
         gpiote: Gpiote,
+        usb_device: UsbDevice,
+        usb_serial: UsbSerial,
     }
 
     // Resources shared between tasks
@@ -54,12 +70,15 @@ mod app {
     #[monotonic(binds = SysTick, default = true, priority = 7)]
     type SystickMonotonic = Systick<1000>; // 1000 Hz / 1 ms granularity
 
-    #[init]
+    #[init(local = [clocks: Option<Clocks> = None, usb_bus: Option<UsbBus> = None])]
     fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
         let cm_peripherals = cx.core;
         let peripherals = cx.device;
 
-        let _clocks = hal::clocks::Clocks::new(peripherals.CLOCK).enable_ext_hfosc();
+        let clocks = hal::clocks::Clocks::new(peripherals.CLOCK).enable_ext_hfosc();
+        cx.local.clocks.replace(clocks);
+
+        let clocks = cx.local.clocks.as_ref().unwrap();
 
         let mono = Systick::new(cm_peripherals.SYST, 64_000_000);
 
@@ -91,7 +110,23 @@ mod app {
         let fusb302 = fusb302::Fusb302::new(twim).unwrap();
         let state_machine = usb_fsm::UsbFsm::new(fusb302, irq_pin, vbus_pin).unwrap();
 
+        let usb_peripheral = hal::usbd::UsbPeripheral::new(peripherals.USBD, &clocks);
+        let usb_bus = hal::usbd::Usbd::new(usb_peripheral);
+        cx.local.usb_bus.replace(usb_bus);
+        let usb_bus = cx.local.usb_bus.as_ref().unwrap();
+
+        let usb_serial = SerialPort::new(&usb_bus);
+
+        // TODO(javier-varez): Modify VID-PID pair. Currently using a test set from pid.codes
+        let usb_device = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x1209, 0x0001))
+            .manufacturer("AllThingsEmbedded")
+            .product("USB Whisperer")
+            .device_class(usbd_serial::USB_CLASS_CDC)
+            .serial_number("A000_0000")
+            .build();
+
         run_state_machine::spawn().unwrap();
+        usb_task::spawn().unwrap();
 
         (
             Shared {
@@ -101,6 +136,8 @@ mod app {
                 state_machine,
                 timer,
                 gpiote,
+                usb_device,
+                usb_serial,
             },
             init::Monotonics(mono),
         )
@@ -111,6 +148,20 @@ mod app {
         loop {
             cortex_m::asm::wfi();
         }
+    }
+
+    #[task(local = [usb_device, usb_serial], priority = 3)]
+    fn usb_task(cx: usb_task::Context) {
+        let usb_task::LocalResources {
+            usb_device,
+            usb_serial,
+        } = cx.local;
+
+        if usb_device.poll(&mut [usb_serial]) {
+            usb_serial.write("hello world!\n".as_bytes()).ok();
+        }
+
+        usb_task::spawn_after(2.millis()).unwrap();
     }
 
     #[task(local = [gpiote], shared = [fsm_spawn_handle], binds = GPIOTE, priority = 2)]
