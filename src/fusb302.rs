@@ -438,11 +438,11 @@ impl<T: WriteRead + Write> Fusb302<T> {
         defmt::dbg!("irqb 0x{:x}", irqb);
 
         if (irqa & registers::interrupta::TX_SENT) != 0 {
-            defmt::info!("TX Sent IRQ received");
+            defmt::info!("ISR: Message sent");
         }
 
         if (irqb & registers::interruptb::GCRCSENT) != 0 {
-            defmt::info!("Good crc sent, message has been received");
+            defmt::info!("ISR: Received message available");
             received_messages = true;
         }
 
@@ -462,7 +462,7 @@ impl<T: WriteRead + Write> Fusb302<T> {
         }
 
         if (irq & registers::interrupt::VBUS_OK) != 0 {
-            defmt::info!("VBUS ok irq");
+            defmt::info!("ISR: VBUS ok");
             vbus_ok = true;
         }
 
@@ -490,6 +490,12 @@ impl<T: WriteRead + Write> Fusb302<T> {
 
         let mut header = message.get_header();
         let objects = message.get_data();
+
+        defmt::info!(
+            "Sending message {:?}, {:x}",
+            header.message_type()?,
+            &objects[..]
+        );
 
         self.current_msg_id += 1;
         if self.current_msg_id > 7 {
@@ -557,28 +563,26 @@ impl<T: WriteRead + Write> Fusb302<T> {
             (token_and_header[1] as u16) | ((token_and_header[2] as u16) << 8),
         );
 
-        defmt::info!("header {}", header.0);
-
         let msg_type = header.message_type()?;
         let sop_target = match token_and_header[0] & registers::fifo::rx_tokens::MASK {
             registers::fifo::rx_tokens::SOP => {
-                defmt::info!("SOP recv {}", msg_type);
+                defmt::info!("Received SOP {}", msg_type);
                 SopTarget::SOP
             }
             registers::fifo::rx_tokens::SOP1 => {
-                defmt::info!("SOP' recv {}", msg_type);
+                defmt::info!("Received SOP' {}", msg_type);
                 SopTarget::SOP1
             }
             registers::fifo::rx_tokens::SOP2 => {
-                defmt::info!("SOP'' recv {}", msg_type);
+                defmt::info!("Received SOP'' {}", msg_type);
                 SopTarget::SOP2
             }
             registers::fifo::rx_tokens::SOP1DB => {
-                defmt::info!("SOP'Debug recv {}", msg_type);
+                defmt::info!("Received SOP'Debug {}", msg_type);
                 SopTarget::SOP1DB
             }
             registers::fifo::rx_tokens::SOP2DB => {
-                defmt::info!("SOP''Debug recv {}", msg_type);
+                defmt::info!("Received SOP''Debug {}", msg_type);
                 SopTarget::SOP2DB
             }
             _ => panic!("Unknown packet received {:?}", msg_type),

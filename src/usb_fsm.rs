@@ -104,23 +104,23 @@ where
     pub fn run<V: DelayUs<u32>>(&mut self, timer: &mut V) -> Result<(), Error<T>> {
         match self.run_inner(timer) {
             Err(Error::DeviceError(fusb302::Error::HardResetRequested)) => {
-                defmt::error!("Hard reset requested");
+                defmt::error!("UsbFsm - Hard reset requested");
                 self.trigger_transition(State::RecoverError);
                 Ok(())
             }
             Err(Error::DeviceError(fusb302::Error::SoftResetRequested)) => {
-                defmt::error!("Soft reset requested");
+                defmt::error!("UsbFsm - Soft reset requested");
                 self.trigger_transition(State::RecoverError);
                 Ok(())
             }
             Err(Error::DeviceError(fusb302::Error::TxRetryFailed)) => {
-                defmt::error!("Max retries reached");
+                defmt::error!("UsbFsm - Max retries reached");
                 self.trigger_transition(State::RecoverError);
                 Ok(())
             }
             Err(Error::DeviceError(fusb302::Error::IOReadError(_)))
             | Err(Error::DeviceError(fusb302::Error::IOWriteError(_))) => {
-                defmt::error!("IO Error, trying to recover");
+                defmt::error!("UsbFsm - IO Error, trying to recover");
                 self.trigger_transition(State::RecoverError);
                 Ok(())
             }
@@ -141,9 +141,9 @@ where
 
         if vbus_ok {
             if self.pd_controller.get_vbus_state()? {
-                defmt::dbg!("VBUS high");
+                defmt::dbg!("UsbFsm - VBUS high");
             } else {
-                defmt::dbg!("VBUS low");
+                defmt::dbg!("UsbFsm - VBUS low");
                 if matches!(
                     self.current_state,
                     State::SendSourceCapabilities
@@ -163,7 +163,7 @@ where
             State::Disconnected => {
                 match self.pd_controller.detect_cc_orientation(timer)? {
                     Some(orientation) => {
-                        defmt::info!("Detected line {}", orientation);
+                        defmt::info!("UsbFsm - Detected line {}", orientation);
                         self.trigger_transition(State::DebounceConnection);
                     }
                     None => {}
@@ -177,11 +177,11 @@ where
                             self.trigger_transition(State::ApplyVbus);
                         }
                         Some(orientation) => {
-                            defmt::warn!("Orientation {} does not match", orientation);
+                            defmt::warn!("UsbFsm - Orientation {} does not match", orientation);
                             self.trigger_transition(State::Disconnected);
                         }
                         _ => {
-                            defmt::info!("Device disconnected");
+                            defmt::info!("UsbFsm - Device disconnected");
                             self.trigger_transition(State::Disconnected);
                         }
                     }
@@ -200,7 +200,7 @@ where
                 }
 
                 if self.elapsed_since_entry().into_ms() > 100 {
-                    defmt::warn!("Timeout waiting for vbus to be enabled");
+                    defmt::warn!("UsbFsm - Timeout waiting for vbus to be enabled");
                     self.trigger_transition(State::RecoverError);
                 }
             }
@@ -219,7 +219,7 @@ where
                 }?;
 
                 if self.elapsed_since_entry().into_ms() > 2000 {
-                    defmt::warn!("Could not send capabilities, giving up");
+                    defmt::warn!("UsbFsm - Could not send capabilities, giving up");
                     self.trigger_transition(State::RecoverError);
                 }
             }
@@ -240,7 +240,7 @@ where
                             _ => {
                                 // Received unexpected message
                                 defmt::warn!(
-                                    "Received unexpected message in SendSourceCapabilities"
+                                    "UsbFsm - Received unexpected message in SendSourceCapabilities"
                                 );
                             }
                         }
@@ -249,7 +249,7 @@ where
 
                 // Timeout after 2 s
                 if self.elapsed_since_entry().into_ms() > 2000 {
-                    defmt::warn!("No request, giving up");
+                    defmt::warn!("UsbFsm - No request, giving up");
                     self.trigger_transition(State::RecoverError);
                 }
             }
@@ -267,7 +267,7 @@ where
 
                 // Timeout after 2 s
                 if self.elapsed_since_entry().into_ms() > 2000 {
-                    defmt::warn!("Accept message not sent, giving up");
+                    defmt::warn!("UsbFsm - Accept message not sent, giving up");
                     self.trigger_transition(State::RecoverError);
                 }
             }
@@ -285,7 +285,7 @@ where
 
                 // Timeout after 2 s
                 if self.elapsed_since_entry().into_ms() > 2000 {
-                    defmt::warn!("PS Rdy not sent, giving up");
+                    defmt::warn!("UsbFsm - PS Rdy not sent, giving up");
                     self.trigger_transition(State::RecoverError);
                 }
             }
@@ -310,13 +310,13 @@ where
 
                 // Timeout after 2 s
                 if self.elapsed_since_entry().into_ms() > 2000 {
-                    defmt::warn!("Uart configuration timeout");
+                    defmt::warn!("UsbFsm - Uart configuration timeout");
                     self.trigger_transition(State::RecoverError);
                 }
             }
             State::Connected => {
                 if !self.pd_controller.monitor_connection(timer)? {
-                    defmt::info!("Device disconnected");
+                    defmt::info!("UsbFsm - Device disconnected");
                     self.vbus_pin.set_low().unwrap_or_default();
                     self.pd_controller.configure_port_type(PortType::Open)?;
                     self.trigger_transition(State::WaitRecovery);
@@ -349,7 +349,11 @@ where
         if received_messages {
             while !self.pd_controller.is_rx_fifo_empty()? {
                 let (target, header, _objects) = self.pd_controller.receive_message()?;
-                defmt::warn!("Received unexpected message {}, {}", target, header);
+                defmt::warn!(
+                    "UsbFsm - Received unexpected message {}, {}",
+                    target,
+                    header
+                );
             }
         }
 
@@ -368,7 +372,7 @@ where
     }
 
     fn trigger_transition(&mut self, state: State) {
-        defmt::info!("{} => {}", self.current_state, state);
+        defmt::info!("UsbFsm - State switch: {} => {}", self.current_state, state);
         self.current_state = state;
         self.entry_time = system_timer::get_ms();
         self.interval_time = self.entry_time;

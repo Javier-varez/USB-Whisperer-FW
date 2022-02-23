@@ -1,4 +1,3 @@
-
 #[derive(Clone, Copy, Debug, defmt::Format)]
 pub struct Instant(u32);
 
