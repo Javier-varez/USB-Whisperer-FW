@@ -1,5 +1,5 @@
 [package]
-name = "fusb302_test"
+name = "usb-whisperer-fw"
 version = "0.1.0"
 edition = "2021"
 authors = ["Javier Alvarez <javier.alvarez@allthingsembedded.net>"]

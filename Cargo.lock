@@ -248,24 +248,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fusb302_test"
-version = "0.1.0"
-dependencies = [
- "cortex-m",
- "cortex-m-rt",
- "cortex-m-rtic",
- "defmt",
- "defmt-rtt",
- "embedded-hal",
- "heapless",
- "nrf52840-hal",
- "panic-probe",
- "systick-monotonic",
- "usb-device",
- "usbd-serial",
-]
-
-[[package]]
 name = "gcd"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -618,6 +600,24 @@ name = "usb-device"
 version = "0.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6be90410d4772074ea49525e2e753b65920b94b57eee21a6ef7b6a6fe6296245"
+
+[[package]]
+name = "usb-whisperer-fw"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "cortex-m-rtic",
+ "defmt",
+ "defmt-rtt",
+ "embedded-hal",
+ "heapless",
+ "nrf52840-hal",
+ "panic-probe",
+ "systick-monotonic",
+ "usb-device",
+ "usbd-serial",
+]
 
 [[package]]
 name = "usbd-serial"
