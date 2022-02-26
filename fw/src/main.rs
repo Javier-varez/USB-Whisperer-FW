@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod cmd_handler;
 mod fusb302;
 mod system_timer;
 mod usb_fsm;
@@ -46,7 +47,7 @@ mod app {
         clocks::Clocks<clocks::ExternalOscillator, clocks::Internal, clocks::LfOscStopped>;
     type UsbBus =
         usb_device::bus::UsbBusAllocator<hal::usbd::Usbd<hal::usbd::UsbPeripheral<'static>>>;
-    type UsbSerial = SerialPort<'static, hal::usbd::Usbd<hal::usbd::UsbPeripheral<'static>>>;
+    pub type UsbSerial = SerialPort<'static, hal::usbd::Usbd<hal::usbd::UsbPeripheral<'static>>>;
     type UsbDevice =
         usb_device::device::UsbDevice<'static, hal::usbd::Usbd<hal::usbd::UsbPeripheral<'static>>>;
     type UsbFsm = usb_fsm::UsbFsm<Twim<TWIM0>, Pin<Input<PullUp>>, Pin<Output<PushPull>>>;
@@ -158,7 +159,8 @@ mod app {
         } = cx.local;
 
         if usb_device.poll(&mut [usb_serial]) {
-            usb_serial.write("hello world!\n".as_bytes()).ok();
+            // usb_serial.write("hello world!\n".as_bytes()).ok();
+            super::cmd_handler::send_state(usb_serial).unwrap();
         }
 
         usb_task::spawn_after(2.millis()).unwrap();
