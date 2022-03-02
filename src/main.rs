@@ -164,7 +164,7 @@ mod app {
         usb_task::spawn_after(2.millis()).unwrap();
     }
 
-    #[task(local = [gpiote], shared = [fsm_spawn_handle], binds = GPIOTE, priority = 2)]
+    #[task(local = [gpiote], shared = [fsm_spawn_handle], binds = GPIOTE, priority = 1)]
     fn gpiote_irq(cx: gpiote_irq::Context) {
         // We need to handle the IRQ here and let the state machine now it needs to run
         let gpiote = cx.local.gpiote;
