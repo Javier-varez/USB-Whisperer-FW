@@ -14,8 +14,8 @@ use embedded_hal::{
     },
     digital::v2::{InputPin, OutputPin},
 };
-#[derive(defmt::Format)]
-enum State {
+#[derive(defmt::Format, Clone, Copy)]
+pub enum State {
     Disconnected,
     DebounceConnection,
     ApplyVbus,
@@ -101,34 +101,34 @@ where
         }
     }
 
-    pub fn run<V: DelayUs<u32>>(&mut self, timer: &mut V) -> Result<(), Error<T>> {
+    pub fn run<V: DelayUs<u32>>(&mut self, timer: &mut V) -> Result<State, Error<T>> {
         match self.run_inner(timer) {
             Err(Error::DeviceError(fusb302::Error::HardResetRequested)) => {
                 defmt::error!("UsbFsm - Hard reset requested");
                 self.trigger_transition(State::RecoverError);
-                Ok(())
+                Ok(self.current_state)
             }
             Err(Error::DeviceError(fusb302::Error::SoftResetRequested)) => {
                 defmt::error!("UsbFsm - Soft reset requested");
                 self.trigger_transition(State::RecoverError);
-                Ok(())
+                Ok(self.current_state)
             }
             Err(Error::DeviceError(fusb302::Error::TxRetryFailed)) => {
                 defmt::error!("UsbFsm - Max retries reached");
                 self.trigger_transition(State::RecoverError);
-                Ok(())
+                Ok(self.current_state)
             }
             Err(Error::DeviceError(fusb302::Error::IOReadError(_)))
             | Err(Error::DeviceError(fusb302::Error::IOWriteError(_))) => {
                 defmt::error!("UsbFsm - IO Error, trying to recover");
                 self.trigger_transition(State::RecoverError);
-                Ok(())
+                Ok(self.current_state)
             }
             val => val,
         }
     }
 
-    fn run_inner<V: DelayUs<u32>>(&mut self, timer: &mut V) -> Result<(), Error<T>> {
+    fn run_inner<V: DelayUs<u32>>(&mut self, timer: &mut V) -> Result<State, Error<T>> {
         // No interrupts should be received yet, since they are off
         let InterruptStatus {
             received_messages,
@@ -291,6 +291,8 @@ where
             }
             State::ConfigureUart => {
                 let vdm_message = fusb302::StructuredVdmMessage::new(0x5ac, 0x12, &[0x01820306]);
+                // let vdm_message =
+                //     fusb302::StructuredVdmMessage::new(0x5ac, 0x12, &[0x0105, 0x80000000]);
                 self.send_with_interval(SopTarget::SOP2DB, &vdm_message, 100)?;
 
                 if received_messages {
@@ -301,6 +303,7 @@ where
                                 SopTarget::SOP2DB,
                                 MessageType::DataMessage(DataMessageType::VendorDefined, _),
                             ) => {
+                                // cortex_m::asm::bkpt();
                                 self.trigger_transition(State::Connected);
                             }
                             _ => {}
@@ -357,7 +360,7 @@ where
             }
         }
 
-        Ok(())
+        Ok(self.current_state)
     }
 
     fn reinit(&mut self) -> Result<(), Error<T>> {

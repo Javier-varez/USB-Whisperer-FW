@@ -1,87 +1,130 @@
-use serialport::{self, FlowControl, Parity, StopBits};
+use serialport::{self, FlowControl, Parity, SerialPort, SerialPortInfo, StopBits};
 use structopt::StructOpt;
 
-/// Serial errors
-#[derive(Debug, thiserror::Error)]
-pub enum SerialError {
-    #[error("Invalid parity requested \"{0}\"")]
-    InvalidParityString(String),
-    #[error("Invalid stop bits requested \"{0}\"")]
-    InvalidStopBitsString(String),
-    #[error("Defmt data not found")]
-    DefmtDataNotFound,
-}
+use usb_whisperer_lib::message::Message;
 
-fn try_to_serial_parity(parity: &str) -> Result<Parity, SerialError> {
-    match parity {
-        "odd" => Ok(Parity::Odd),
-        "even" => Ok(Parity::Even),
-        "none" => Ok(Parity::None),
-        _ => Err(SerialError::InvalidParityString(parity.to_owned())),
-    }
-}
+use postcard::{
+    flavors::{Cobs, Slice},
+    from_bytes_cobs, serialize_with_flavor,
+};
 
-fn try_to_serial_stop_bits(stop_bits: &str) -> Result<StopBits, SerialError> {
-    match stop_bits {
-        "1" => Ok(StopBits::One),
-        "2" => Ok(StopBits::Two),
-        _ => Err(SerialError::InvalidStopBitsString(stop_bits.to_owned())),
-    }
+#[derive(thiserror::Error, Debug)]
+enum Error {
+    #[error("Device not found")]
+    DeviceNotFound,
 }
 
 #[derive(Debug, StructOpt)]
-#[structopt()]
-struct Opts {
-    /// Path to the uart port device
-    #[structopt(name = "port", required_unless_one(&["list-ports"]))]
-    port: Option<String>,
-
-    /// Serial port baudrate. Defaults to 115200.
-    #[structopt(long, short = "s")]
-    baudrate: Option<u32>,
-
-    /// Serial port stop bits number. Defaults to 1.
-    #[structopt(long, parse(try_from_str=try_to_serial_stop_bits))]
-    stop_bits: Option<StopBits>,
-
-    /// Serial port parity configuration. Defaults to None.
-    #[structopt(long, parse(try_from_str=try_to_serial_parity))]
-    parity: Option<Parity>,
-
-    /// Lists the available serial ports and exits.
-    #[structopt(long)]
-    list_ports: bool,
+enum Commands {
+    Reboot,
+    ConfigureUart,
+    GetDeviceState,
 }
 
-fn main() {
-    let opts = Opts::from_args();
+fn find_port() -> Option<SerialPortInfo> {
+    const EXPECTED_VID: u16 = 0x1209;
+    const EXPECTED_PID: u16 = 0x0001;
 
-    if opts.list_ports {
-        let available_ports = serialport::available_ports()?;
-        for port in available_ports {
-            println!("{:?}", port);
+    let available_ports = serialport::available_ports().ok()?;
+    let mut port: Option<SerialPortInfo> = None;
+
+    for p in available_ports {
+        match p.port_type {
+            serialport::SerialPortType::UsbPort(ref port_info)
+                if port_info.vid == EXPECTED_VID && port_info.pid == EXPECTED_PID =>
+            {
+                port = Some(p);
+                break;
+            }
+            _ => {}
         }
-        return Ok(());
     }
 
-    let verbose = false;
-    defmt_decoder::log::init_logger(verbose, |_| true);
+    port
+}
 
-    let elf_data = std::fs::read(&opts.elf.unwrap())?;
-    let table = Table::parse(&elf_data)?.ok_or(SerialError::DefmtDataNotFound)?;
-    let locs = table.get_locations(&elf_data)?;
+fn send_message(port: &mut dyn SerialPort, message: &Message) -> anyhow::Result<Message> {
+    let mut buffer = [0; 128];
+    let serialized = serialize_with_flavor::<Message, Cobs<Slice>, &mut [u8]>(
+        message,
+        Cobs::try_new(Slice::new(&mut buffer)).unwrap(),
+    )?;
 
-    let locs = if table.indices().all(|idx| locs.contains_key(&(idx as u64))) {
-        Some(locs)
-    } else {
-        log::warn!("(BUG) location info is incomplete; it will be omitted from the output");
-        None
-    };
+    port.write(serialized)?;
 
-    let mut port = serialport::new(opts.port.unwrap(), opts.baudrate.unwrap_or(115200u32))
-        .parity(opts.parity.unwrap_or(Parity::None))
-        .stop_bits(opts.stop_bits.unwrap_or(StopBits::One))
+    // Expect ACK
+    let size = port.read(&mut buffer)?;
+    let message = from_bytes_cobs::<'_, Message>(&mut buffer[..size])?;
+
+    Ok(message)
+}
+
+fn main() -> anyhow::Result<()> {
+    let commands = Commands::from_args();
+
+    let port_info = find_port().ok_or(Error::DeviceNotFound)?;
+
+    let mut port = serialport::new(port_info.port_name, 115200u32)
+        .parity(Parity::None)
+        .stop_bits(StopBits::One)
         .flow_control(FlowControl::None)
         .open()?;
-    port.set_timeout(std::time::Duration::from_millis(100))?;
+
+    port.set_timeout(std::time::Duration::from_millis(500))?;
+    port.write_data_terminal_ready(true)?;
+
+    match commands {
+        Commands::Reboot => {
+            println!("Rebooting device");
+            let message = Message::Reboot;
+            match send_message(&mut *port, &message)? {
+                Message::Ack => {
+                    println!("=> ACK");
+                }
+                Message::Nack => {
+                    println!("=> NACK");
+                }
+                m => {
+                    println!("Unexpected Message: {:?}", m);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::ConfigureUart => {
+            println!("Configuring UART");
+            let message = Message::ConfigureUart;
+            match send_message(&mut *port, &message)? {
+                Message::Ack => {
+                    println!("=> ACK");
+                }
+                Message::Nack => {
+                    println!("=> NACK");
+                }
+                m => {
+                    println!("Unexpected Message: {:?}", m);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::GetDeviceState => {
+            println!("Getting device state");
+            let message = Message::RequestState;
+            match send_message(&mut *port, &message)? {
+                Message::ReportState(state) => {
+                    println!("=> State {:?}", state);
+                }
+                Message::Nack => {
+                    println!("=> NACK");
+                }
+                m => {
+                    println!("Unexpected Message: {:?}", m);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    port.write_data_terminal_ready(false)?;
+
+    Ok(())
 }
