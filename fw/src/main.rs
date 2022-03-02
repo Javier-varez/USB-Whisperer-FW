@@ -23,9 +23,9 @@ pub fn exit() -> ! {
     }
 }
 
-#[rtic::app(device = nrf52840_hal::pac, dispatchers = [NFCT, USBD])]
+#[rtic::app(device = nrf52840_hal::pac, dispatchers = [NFCT, USBD, TIMER0])]
 mod app {
-    use super::{fusb302, usb_fsm};
+    use super::{cmd_handler, fusb302, usb_fsm};
     use nrf52840_hal::{self as hal, gpiote::Gpiote};
     use systick_monotonic::*;
 
@@ -39,6 +39,8 @@ mod app {
 
     use usb_device::prelude::*;
     use usbd_serial::SerialPort;
+
+    use usb_whisperer_lib::message::{Message, State};
 
     defmt::timestamp!("{=u64:us}", { monotonics::now().ticks() * 1000 });
 
@@ -59,13 +61,15 @@ mod app {
         timer: Timer<TIMER0>,
         gpiote: Gpiote,
         usb_device: UsbDevice,
-        usb_serial: UsbSerial,
+        command_handler: cmd_handler::CommandHandler,
     }
 
     // Resources shared between tasks
     #[shared]
     struct Shared {
         fsm_spawn_handle: Option<run_state_machine::SpawnHandle>,
+        usb_serial: UsbSerial,
+        state: State,
     }
 
     #[monotonic(binds = SysTick, default = true, priority = 7)]
@@ -129,16 +133,21 @@ mod app {
         run_state_machine::spawn().unwrap();
         usb_task::spawn().unwrap();
 
+        let command_handler = cmd_handler::CommandHandler::new();
+        let state = State::Disconnected;
+
         (
             Shared {
                 fsm_spawn_handle: None,
+                usb_serial,
+                state,
             },
             Local {
                 state_machine,
                 timer,
                 gpiote,
                 usb_device,
-                usb_serial,
+                command_handler,
             },
             init::Monotonics(mono),
         )
@@ -151,19 +160,72 @@ mod app {
         }
     }
 
-    #[task(local = [usb_device, usb_serial], priority = 3)]
+    #[task(local = [usb_device], shared = [usb_serial], priority = 3)]
     fn usb_task(cx: usb_task::Context) {
-        let usb_task::LocalResources {
-            usb_device,
-            usb_serial,
-        } = cx.local;
+        let usb_task::LocalResources { usb_device } = cx.local;
+        let usb_task::SharedResources { mut usb_serial } = cx.shared;
 
-        if usb_device.poll(&mut [usb_serial]) {
-            // usb_serial.write("hello world!\n".as_bytes()).ok();
-            super::cmd_handler::send_state(usb_serial).unwrap();
-        }
+        usb_serial.lock(|usb_serial| {
+            if usb_device.poll(&mut [usb_serial]) {
+                // Make sure the message handler will process the event
+                msg_handler::spawn().ok();
+            }
+        });
 
         usb_task::spawn_after(2.millis()).unwrap();
+    }
+
+    #[task(shared = [usb_serial, state], local = [command_handler], priority = 2)]
+    fn msg_handler(cx: msg_handler::Context) {
+        let msg_handler::SharedResources {
+            mut usb_serial,
+            mut state,
+        } = cx.shared;
+        let msg_handler::LocalResources { command_handler } = cx.local;
+
+        let mut buffer = [0u8; 128];
+        match usb_serial.lock(|usb_serial| usb_serial.read(&mut buffer)) {
+            Ok(size) => match command_handler.deserialize_message(&mut buffer[..size]) {
+                Ok(message) => {
+                    let mut send_message = |message: &Message| {
+                        let message_buffer = command_handler
+                            .serialize_message(message, &mut buffer)
+                            .unwrap();
+                        usb_serial
+                            .lock(|usb_serial| usb_serial.write(message_buffer))
+                            .unwrap()
+                    };
+                    let state = state.lock(|state| *state);
+                    match message {
+                        Message::ConfigureUart => {
+                            // TODO(javier-varez): Send message to UsbFsm
+                            match state {
+                                State::Attached => send_message(&Message::Ack),
+                                _ => send_message(&Message::Nack),
+                            };
+                        }
+                        Message::Reboot => {
+                            // TODO(javier-varez): Send message to UsbFsm
+                            match state {
+                                State::Attached => send_message(&Message::Ack),
+                                _ => send_message(&Message::Nack),
+                            };
+                        }
+                        Message::RequestState => {
+                            send_message(&Message::ReportState(state));
+                        }
+                        _ => {
+                            send_message(&Message::Nack);
+                        }
+                    }
+                }
+                Err(usb_whisperer_lib::message::Error::WouldBlock) => {}
+            },
+            Err(UsbError::WouldBlock) => {}
+            Err(_) => {
+                defmt::warn!("Read from usb failed");
+            }
+        }
     }
 
     #[task(local = [gpiote], shared = [fsm_spawn_handle], binds = GPIOTE, priority = 1)]
@@ -186,18 +248,29 @@ mod app {
         }
     }
 
-    #[task(local = [state_machine, timer], shared = [fsm_spawn_handle], capacity = 1, priority = 1)]
+    #[task(local = [state_machine, timer], shared = [fsm_spawn_handle, state], capacity = 1, priority = 1)]
     fn run_state_machine(cx: run_state_machine::Context) {
         let run_state_machine::LocalResources {
             timer,
             state_machine,
         } = cx.local;
-        let mut spawn_handle = cx.shared.fsm_spawn_handle;
+        let run_state_machine::SharedResources {
+            mut fsm_spawn_handle,
+            mut state,
+        } = cx.shared;
 
-        state_machine.run(timer).unwrap();
+        let new_state = state_machine.run(timer).unwrap();
+        state.lock(|state| {
+            *state = match new_state {
+                usb_fsm::State::Connected => State::Attached,
+                usb_fsm::State::Disconnected => State::Disconnected,
+                usb_fsm::State::ConfigureUart => State::Busy,
+                _ => State::Negotiating,
+            }
+        });
 
         // Spawn again after 4 ms
         let handle = run_state_machine::spawn_after(4.millis()).unwrap();
-        spawn_handle.lock(|hdl| hdl.replace(handle));
+        fsm_spawn_handle.lock(|hdl| hdl.replace(handle));
     }
 }

@@ -1,45 +1,73 @@
-use embedded_hal::serial::Write;
 use postcard::{
     flavors::{Cobs, Slice},
-    serialize_with_flavor,
+    from_bytes_cobs, serialize_with_flavor,
 };
-use serde::{Deserialize, Serialize};
 
-use super::app::UsbSerial;
-// use usbd_serial::SerialPort;
+use usb_whisperer_lib::message::{Error, Message};
 
-#[derive(Serialize, Deserialize)]
-enum State {
-    Disconnected,
-    Negotiating,
-    Active,
+pub struct CommandHandler {
+    buffer: [u8; 128],
+    cursor: usize,
 }
 
-#[derive(Serialize, Deserialize)]
-enum Message {
-    RequestStatus,
-    ReportStatus(State, &'static str),
-}
+impl CommandHandler {
+    pub fn new() -> Self {
+        Self {
+            buffer: [0; 128],
+            cursor: 0,
+        }
+    }
 
-#[derive(Debug)]
-pub enum Error {
-    Bleh,
-}
+    pub fn serialize_message<'a>(
+        &self,
+        message: &Message,
+        buffer: &'a mut [u8],
+    ) -> Result<&'a mut [u8], Error> {
+        let serialized = serialize_with_flavor::<Message, Cobs<Slice>, &mut [u8]>(
+            message,
+            Cobs::try_new(Slice::new(buffer)).unwrap(),
+        )
+        .unwrap();
 
-fn send_message(writer: &mut UsbSerial, message: &Message) -> Result<(), Error> {
-    let mut buffer = [0u8; 128];
+        Ok(serialized)
+    }
 
-    let serialized = serialize_with_flavor::<Message, Cobs<Slice>, &mut [u8]>(
-        message,
-        Cobs::try_new(Slice::new(&mut buffer)).unwrap(),
-    )
-    .unwrap();
+    pub fn deserialize_message(&mut self, buffer: &mut [u8]) -> Result<Message, Error> {
+        let mut last_index = buffer.len();
+        let mut has_message = false;
 
-    writer.write(&serialized);
-    Ok(())
-}
+        for (index, byte) in buffer.iter().enumerate() {
+            self.buffer[self.cursor] = *byte;
+            self.cursor += 1;
 
-pub fn send_state(writer: &mut UsbSerial) -> Result<(), Error> {
-    let message = Message::ReportStatus(State::Disconnected, "Hi there\n");
-    send_message(writer, &message)
+            if *byte == 0 {
+                // Store the message and keep the rest of the data
+                has_message = true;
+                last_index = index;
+                break;
+            }
+        }
+
+        if has_message {
+            let message = from_bytes_cobs::<'_, Message>(&mut self.buffer[..self.cursor]).unwrap();
+            self.cursor = 0;
+
+            // Store the rest of the data in the buffer
+            if last_index != buffer.len() - 1 {
+                let buffer = &buffer[last_index + 1..];
+                for byte in buffer {
+                    self.buffer[self.cursor] = *byte;
+                    self.cursor += 1;
+
+                    if *byte == 0 {
+                        panic!("More than one message in the same packet! This is not supported!");
+                    }
+                }
+            }
+
+            return Ok(message);
+        }
+
+        Err(Error::WouldBlock)
+    }
 }

@@ -1,5 +1,5 @@
 [package]
-name = "usb_whisperer"
+name = "usb-whisperer"
 version = "0.1.0"
 edition = "2021"
 
@@ -12,3 +12,6 @@ ctrlc = "3.1.7"
 log = "0.4.14"
 serialport = "4.0"
 anyhow = "1.0.43"
+usb-whisperer-lib = { path = "../usb_whisperer_lib" }
+serde = "1.0"
+postcard = "0.7"

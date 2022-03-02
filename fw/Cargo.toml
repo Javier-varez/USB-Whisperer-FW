@@ -21,6 +21,7 @@ usb-device = "0.2.8"
 usbd-serial = "0.1.1"
 postcard = "0.7.3"
 serde = { version = "1.0", default-features = false, features = ["derive"] }
+usb-whisperer-lib = { path = "../usb_whisperer_lib" }
 
 # cargo build/run
 [profile.dev]

@@ -3,22 +3,27 @@
 pub mod message {
     use serde::{Deserialize, Serialize};
 
-    #[derive(Serialize, Deserialize)]
-    enum State {
+    #[derive(Serialize, Deserialize, Debug, defmt::Format, Clone, Copy)]
+    pub enum State {
         Disconnected,
         Negotiating,
-        Active,
+        Attached,
+        Busy,
     }
 
-    #[derive(Serialize, Deserialize)]
-    enum Message {
-        RequestStatus,
-        ReportStatus(State, &'static str),
+    #[derive(Serialize, Deserialize, Debug, defmt::Format)]
+    pub enum Message {
+        Reboot,
+        ConfigureUart,
+        RequestState,
+        ReportState(State),
+        Ack,
+        Nack,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, defmt::Format)]
     pub enum Error {
-        Bleh,
+        WouldBlock,
     }
 }
 
