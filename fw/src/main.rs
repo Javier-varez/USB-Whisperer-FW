@@ -7,13 +7,37 @@ mod system_timer;
 mod usb_fsm;
 
 use defmt_rtt as _; // global logger
-use panic_probe as _;
 
-// same panicking *behavior* as `panic-probe` but doesn't print a panic message
-// this prevents the panic message being printed *twice* when `defmt::panic` is invoked
-#[defmt::panic_handler]
-fn panic() -> ! {
-    cortex_m::asm::udf()
+use core::panic::PanicInfo;
+
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    use embedded_hal::blocking::delay::DelayMs;
+    use embedded_hal::digital::v2::{OutputPin, StatefulOutputPin};
+    use nrf52840_hal as hal;
+
+    let peripherals = unsafe { hal::pac::Peripherals::steal() };
+    let p0 = hal::gpio::p0::Parts::new(peripherals.P0);
+
+    let mut timer = hal::timer::Timer::new(peripherals.TIMER0);
+
+    let mut led = p0
+        .p0_30
+        .into_push_pull_output(hal::gpio::Level::High)
+        .degrade();
+
+    defmt::error!("Panicked with message: {}", defmt::Display2Format(info));
+
+    for _ in 0..10 {
+        if led.is_set_high().unwrap() {
+            led.set_low().unwrap();
+        } else {
+            led.set_high().unwrap();
+        }
+        timer.delay_ms(1000u32);
+    }
+
+    cortex_m::asm::udf();
 }
 
 /// Terminates the application and makes `probe-run` exit with exit-code = 0
@@ -42,6 +66,8 @@ mod app {
 
     use usb_whisperer_lib::message::Message;
 
+    use embedded_hal::digital::v2::{OutputPin, StatefulOutputPin};
+
     defmt::timestamp!("{=u64:us}", { monotonics::now().ticks() * 1000 });
 
     // Type shorthands
@@ -61,6 +87,7 @@ mod app {
         gpiote: Gpiote,
         usb_device: UsbDevice,
         command_handler: cmd_handler::CommandHandler,
+        led: Pin<Output<PushPull>>,
     }
 
     // Resources shared between tasks
@@ -104,6 +131,11 @@ mod app {
 
         let timer = hal::timer::Timer::new(peripherals.TIMER0);
 
+        let led = p0
+            .p0_29
+            .into_push_pull_output(hal::gpio::Level::High)
+            .degrade();
+
         let gpiote = hal::gpiote::Gpiote::new(peripherals.GPIOTE);
         gpiote
             .channel0()
@@ -127,10 +159,12 @@ mod app {
             .product("USB Whisperer")
             .device_class(usbd_serial::USB_CLASS_CDC)
             .serial_number("A000_0000")
+            .max_power(500)
             .build();
 
         run_state_machine::spawn().unwrap();
         usb_task::spawn().unwrap();
+        led_task::spawn_after(1.secs()).unwrap();
 
         let command_handler = cmd_handler::CommandHandler::new();
 
@@ -145,6 +179,7 @@ mod app {
                 gpiote,
                 usb_device,
                 command_handler,
+                led,
             },
             init::Monotonics(mono),
         )
@@ -240,5 +275,16 @@ mod app {
         // Spawn again after 4 ms
         let handle = run_state_machine::spawn_after(4.millis()).unwrap();
         fsm_spawn_handle.lock(|hdl| hdl.replace(handle));
+    }
+
+    #[task(local = [led], priority = 1)]
+    fn led_task(cx: led_task::Context) {
+        let led_task::LocalResources { led } = cx.local;
+        if led.is_set_high().unwrap() {
+            led.set_low().unwrap();
+        } else {
+            led.set_high().unwrap();
+        }
+        led_task::spawn_after(1.secs()).unwrap();
     }
 }
