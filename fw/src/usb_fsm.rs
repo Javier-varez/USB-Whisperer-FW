@@ -7,6 +7,8 @@ use super::fusb302::{
 
 use crate::system_timer;
 
+use usb_whisperer_lib::message;
+
 use embedded_hal::{
     blocking::{
         delay::DelayUs,
@@ -14,7 +16,8 @@ use embedded_hal::{
     },
     digital::v2::{InputPin, OutputPin},
 };
-#[derive(defmt::Format, Clone, Copy)]
+
+#[derive(defmt::Format, Clone, Copy, PartialEq)]
 pub enum State {
     Disconnected,
     DebounceConnection,
@@ -383,5 +386,39 @@ where
 
     fn elapsed_since_entry(&self) -> system_timer::Duration {
         system_timer::elapsed_since(self.entry_time)
+    }
+
+    pub fn current_state_to_global_state(&self) -> message::State {
+        match self.current_state {
+            State::Connected => message::State::Attached,
+            State::Disconnected => message::State::Disconnected,
+            State::ConfigureUart => message::State::Busy,
+            _ => message::State::Negotiating,
+        }
+    }
+
+    pub fn run_command(
+        &mut self,
+        message: &message::Message,
+    ) -> Result<message::Message, Error<T>> {
+        match message {
+            message::Message::ConfigureUart if self.current_state == State::Connected => {
+                let vdm_message = fusb302::StructuredVdmMessage::new(0x5ac, 0x12, &[0x01820306]);
+                self.pd_controller
+                    .send_message(SopTarget::SOP2DB, &vdm_message)?;
+                Ok(message::Message::Ack)
+            }
+            message::Message::Reboot if self.current_state == State::Connected => {
+                let vdm_message =
+                    fusb302::StructuredVdmMessage::new(0x5ac, 0x12, &[0x0105, 0x80000000]);
+                self.pd_controller
+                    .send_message(SopTarget::SOP2DB, &vdm_message)?;
+                Ok(message::Message::Ack)
+            }
+            message::Message::RequestState if self.current_state == State::Connected => Ok(
+                message::Message::ReportState(self.current_state_to_global_state()),
+            ),
+            _ => Ok(message::Message::Nack),
+        }
     }
 }
