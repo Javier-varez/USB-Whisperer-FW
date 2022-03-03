@@ -40,7 +40,7 @@ mod app {
     use usb_device::prelude::*;
     use usbd_serial::SerialPort;
 
-    use usb_whisperer_lib::message::{Message, State};
+    use usb_whisperer_lib::message::Message;
 
     defmt::timestamp!("{=u64:us}", { monotonics::now().ticks() * 1000 });
 

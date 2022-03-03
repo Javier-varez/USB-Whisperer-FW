@@ -16,7 +16,8 @@ pub mod message {
         Reboot,
         ConfigureUart,
         RequestState,
-        ReportState(State),
+        ReportState(State, bool),
+        SetAutoConfigureUart(bool),
         Ack,
         Nack,
     }

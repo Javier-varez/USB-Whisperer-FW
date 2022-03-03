@@ -1,4 +1,5 @@
 use serialport::{self, FlowControl, Parity, SerialPort, SerialPortInfo, StopBits};
+use std::str::FromStr;
 use structopt::StructOpt;
 
 use usb_whisperer_lib::message::Message;
@@ -14,11 +15,64 @@ enum Error {
     DeviceNotFound,
 }
 
+#[derive(Debug)]
+enum UartAutoConfiguration {
+    Disabled,
+    Enabled,
+}
+
+impl FromStr for UartAutoConfiguration {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "enable" => Ok(UartAutoConfiguration::Enabled),
+            "disable" => Ok(UartAutoConfiguration::Disabled),
+            "1" => Ok(UartAutoConfiguration::Enabled),
+            "0" => Ok(UartAutoConfiguration::Disabled),
+            "true" => Ok(UartAutoConfiguration::Enabled),
+            "false" => Ok(UartAutoConfiguration::Disabled),
+            s => Err(format!("Invalid string {}", s)),
+        }
+    }
+}
+
+impl From<UartAutoConfiguration> for bool {
+    fn from(u: UartAutoConfiguration) -> bool {
+        match u {
+            UartAutoConfiguration::Disabled => false,
+            UartAutoConfiguration::Enabled => true,
+        }
+    }
+}
+
 #[derive(Debug, StructOpt)]
+#[structopt(
+    author,
+    about = "Tool to control the M1 macs closed-case debug channel via USB PD"
+)]
 enum Commands {
+    #[structopt(name = "reboot", about = "Reboots the M1 mac via a USB-PD VDM command")]
     Reboot,
+    #[structopt(
+        name = "config-uart",
+        about = "Configures the UART on the M1 mac. Uses Primary D+/D- lines"
+    )]
     ConfigureUart,
+    #[structopt(
+        name = "reboot-with-uart",
+        about = "Sets the autoconfiguration flag for the UART and reboots."
+    )]
+    RebootAndConfigureUart,
+    #[structopt(name = "get-state", about = "Gets the device state")]
     GetDeviceState,
+    #[structopt(
+        name = "config-attach",
+        about = "Sets the autoconfiguration flag for the UART"
+    )]
+    ConfigureAttach {
+        #[structopt(short = "u", long = "uart")]
+        uart_autoconf: UartAutoConfiguration,
+    },
 }
 
 fn find_port() -> Option<SerialPortInfo> {
@@ -108,12 +162,62 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::ConfigureAttach { uart_autoconf } => {
+            println!("Requesting uart autoconfiguration");
+            let message = Message::SetAutoConfigureUart(uart_autoconf.into());
+            match send_message(&mut *port, &message)? {
+                Message::Ack => {
+                    println!("=> ACK");
+                }
+                Message::Nack => {
+                    println!("=> NACK");
+                }
+                m => {
+                    println!("Unexpected Message: {:?}", m);
+                    port.write_data_terminal_ready(false)?;
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::RebootAndConfigureUart => {
+            println!("Enabling UART autoconfiguration");
+            let message = Message::SetAutoConfigureUart(true);
+            match send_message(&mut *port, &message)? {
+                Message::Ack => {
+                    println!("=> ACK");
+                }
+                Message::Nack => {
+                    println!("=> NACK");
+                }
+                m => {
+                    println!("Unexpected Message: {:?}", m);
+                    port.write_data_terminal_ready(false)?;
+                    std::process::exit(1);
+                }
+            }
+            println!("Rebooting device");
+            let message = Message::Reboot;
+            match send_message(&mut *port, &message)? {
+                Message::Ack => {
+                    println!("=> ACK");
+                }
+                Message::Nack => {
+                    println!("=> NACK");
+                }
+                m => {
+                    println!("Unexpected Message: {:?}", m);
+                    port.write_data_terminal_ready(false)?;
+                    std::process::exit(1);
+                }
+            }
+        }
         Commands::GetDeviceState => {
             println!("Getting device state");
             let message = Message::RequestState;
             match send_message(&mut *port, &message)? {
-                Message::ReportState(state) => {
-                    println!("=> State {:?}", state);
+                Message::ReportState(state, uart_autoconf) => {
+                    println!("=> State: {:?}", state);
+                    println!("=> Uart Autoconfiguration: {:?}", uart_autoconf);
                 }
                 Message::Nack => {
                     println!("=> NACK");

@@ -66,6 +66,7 @@ where
     current_state: State,
     entry_time: system_timer::Instant,
     interval_time: system_timer::Instant,
+    uart_autoconf: bool,
 }
 
 impl<T, U, X> UsbFsm<T, U, X>
@@ -82,6 +83,7 @@ where
             current_state: State::RecoverError,
             entry_time: system_timer::get_ms(),
             interval_time: system_timer::get_ms(),
+            uart_autoconf: false,
         };
 
         fsm.reinit()?;
@@ -278,7 +280,11 @@ where
                 let ps_rdy = PsRdyMessage::new();
                 match self.send_with_interval(SopTarget::SOP, &ps_rdy, 5) {
                     Ok(true) => {
-                        self.trigger_transition(State::ConfigureUart);
+                        if self.uart_autoconf {
+                            self.trigger_transition(State::ConfigureUart);
+                        } else {
+                            self.trigger_transition(State::Connected);
+                        }
                         Ok(())
                     }
                     Ok(false) => Ok(()),
@@ -415,9 +421,14 @@ where
                     .send_message(SopTarget::SOP2DB, &vdm_message)?;
                 Ok(message::Message::Ack)
             }
-            message::Message::RequestState if self.current_state == State::Connected => Ok(
-                message::Message::ReportState(self.current_state_to_global_state()),
-            ),
+            message::Message::RequestState => Ok(message::Message::ReportState(
+                self.current_state_to_global_state(),
+                self.uart_autoconf,
+            )),
+            message::Message::SetAutoConfigureUart(enable) => {
+                self.uart_autoconf = *enable;
+                Ok(message::Message::Ack)
+            }
             _ => Ok(message::Message::Nack),
         }
     }
