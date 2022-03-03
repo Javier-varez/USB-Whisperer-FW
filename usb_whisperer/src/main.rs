@@ -86,6 +86,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 m => {
                     println!("Unexpected Message: {:?}", m);
+                    port.write_data_terminal_ready(false)?;
                     std::process::exit(1);
                 }
             }
@@ -102,6 +103,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 m => {
                     println!("Unexpected Message: {:?}", m);
+                    port.write_data_terminal_ready(false)?;
                     std::process::exit(1);
                 }
             }
@@ -118,6 +120,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 m => {
                     println!("Unexpected Message: {:?}", m);
+                    port.write_data_terminal_ready(false)?;
                     std::process::exit(1);
                 }
             }
