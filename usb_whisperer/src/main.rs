@@ -78,15 +78,22 @@ enum Commands {
 fn find_port() -> Option<SerialPortInfo> {
     const EXPECTED_VID: u16 = 0x1209;
     const EXPECTED_PID: u16 = 0x0001;
+    const EXPECTED_SERIAL: &'static str = "/dev/tty.usbmodemA000_00001";
 
     let available_ports = serialport::available_ports().ok()?;
     let mut port: Option<SerialPortInfo> = None;
 
+    // In macOS USB ports are listed as PciPorts, so we need to work around that and use the serial
+    // number for identification
     for p in available_ports {
         match p.port_type {
             serialport::SerialPortType::UsbPort(ref port_info)
                 if port_info.vid == EXPECTED_VID && port_info.pid == EXPECTED_PID =>
             {
+                port = Some(p);
+                break;
+            }
+            serialport::SerialPortType::PciPort if p.port_name == EXPECTED_SERIAL => {
                 port = Some(p);
                 break;
             }
