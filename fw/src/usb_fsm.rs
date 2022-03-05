@@ -421,6 +421,12 @@ where
                     .send_message(SopTarget::SOP2DB, &vdm_message)?;
                 Ok(message::Message::Ack)
             }
+            message::Message::RawVdm(svid, cmd, args) if self.current_state == State::Connected => {
+                let vdm_message = fusb302::StructuredVdmMessage::new(*svid, *cmd, args);
+                self.pd_controller
+                    .send_message(SopTarget::SOP2DB, &vdm_message)?;
+                Ok(message::Message::Ack)
+            }
             message::Message::RequestState => Ok(message::Message::ReportState(
                 self.current_state_to_global_state(),
                 self.uart_autoconf,

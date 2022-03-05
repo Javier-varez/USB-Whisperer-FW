@@ -1,8 +1,8 @@
 use serialport::{self, FlowControl, Parity, SerialPort, SerialPortInfo, StopBits};
-use std::str::FromStr;
+use std::{num::ParseIntError, str::FromStr};
 use structopt::StructOpt;
 
-use usb_whisperer_lib::message::Message;
+use usb_whisperer_lib::message::{self, Message};
 
 use postcard::{
     flavors::{Cobs, Slice},
@@ -45,6 +45,24 @@ impl From<UartAutoConfiguration> for bool {
     }
 }
 
+fn try_u32_to_str(s: &str) -> Result<u32, ParseIntError> {
+    if s.trim_start().starts_with("0x") {
+        let s = s.trim_start_matches("0x");
+        u32::from_str_radix(s, 16)
+    } else {
+        u32::from_str_radix(s, 10)
+    }
+}
+
+fn try_u16_to_str(s: &str) -> Result<u16, ParseIntError> {
+    if s.trim_start().starts_with("0x") {
+        let s = s.trim_start_matches("0x");
+        u16::from_str_radix(s, 16)
+    } else {
+        u16::from_str_radix(s, 10)
+    }
+}
+
 #[derive(Debug, StructOpt)]
 #[structopt(
     author,
@@ -72,6 +90,18 @@ enum Commands {
     ConfigureAttach {
         #[structopt(short = "u", long = "uart")]
         uart_autoconf: UartAutoConfiguration,
+    },
+    #[structopt(
+        name = "raw-vdm",
+        about = "Sets the autoconfiguration flag for the UART"
+    )]
+    RawVdm {
+        #[structopt(short = "s", long = "svid", default_value = "0x5ac", parse(try_from_str = try_u16_to_str))]
+        svid: u16,
+        #[structopt(short = "c", long = "command", parse(try_from_str = try_u16_to_str))]
+        cmd: u16,
+        #[structopt(short = "a", long = "args", parse(try_from_str = try_u32_to_str))]
+        args: Vec<u32>,
     },
 }
 
@@ -225,6 +255,38 @@ fn main() -> anyhow::Result<()> {
                 Message::ReportState(state, uart_autoconf) => {
                     println!("=> State: {:?}", state);
                     println!("=> Uart Autoconfiguration: {:?}", uart_autoconf);
+                }
+                Message::Nack => {
+                    println!("=> NACK");
+                }
+                m => {
+                    println!("Unexpected Message: {:?}", m);
+                    port.write_data_terminal_ready(false)?;
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::RawVdm { svid, cmd, args } => {
+            println!(
+                "Sending raw vdm. SVID: 0x{:x}, cmd: 0x{:x}, args: {:?}",
+                svid,
+                cmd,
+                &args[..]
+            );
+
+            if args.len() > message::MAX_VDM_ARGS {
+                println!(
+                    "Provided more than {} arguments to vdm command",
+                    message::MAX_VDM_ARGS,
+                );
+                std::process::exit(1);
+            }
+
+            let args = heapless::Vec::<u32, { message::MAX_VDM_ARGS }>::from_slice(&args).unwrap();
+            let message = Message::RawVdm(svid, cmd, args);
+            match send_message(&mut *port, &message)? {
+                Message::Ack => {
+                    println!("=> ACK");
                 }
                 Message::Nack => {
                     println!("=> NACK");

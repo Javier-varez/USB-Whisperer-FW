@@ -1,7 +1,10 @@
 #![no_std]
 
 pub mod message {
+    use heapless::Vec;
     use serde::{Deserialize, Serialize};
+
+    pub const MAX_VDM_ARGS: usize = 6;
 
     #[derive(Serialize, Deserialize, Debug, defmt::Format, Clone, Copy)]
     pub enum State {
@@ -20,6 +23,7 @@ pub mod message {
         SetAutoConfigureUart(bool),
         Ack,
         Nack,
+        RawVdm(u16, u16, Vec<u32, MAX_VDM_ARGS>),
     }
 
     #[derive(Debug, defmt::Format)]

@@ -36,6 +36,7 @@ fn panic(info: &PanicInfo) -> ! {
         }
         timer.delay_ms(1000u32);
     }
+    led.set_high().unwrap();
 
     cortex_m::asm::udf();
 }
