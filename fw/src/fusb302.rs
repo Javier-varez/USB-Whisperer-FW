@@ -564,29 +564,6 @@ impl<T: WriteRead + Write> Fusb302<T> {
         );
 
         let msg_type = header.message_type()?;
-        let sop_target = match token_and_header[0] & registers::fifo::rx_tokens::MASK {
-            registers::fifo::rx_tokens::SOP => {
-                defmt::info!("Received SOP {}", msg_type);
-                SopTarget::SOP
-            }
-            registers::fifo::rx_tokens::SOP1 => {
-                defmt::info!("Received SOP' {}", msg_type);
-                SopTarget::SOP1
-            }
-            registers::fifo::rx_tokens::SOP2 => {
-                defmt::info!("Received SOP'' {}", msg_type);
-                SopTarget::SOP2
-            }
-            registers::fifo::rx_tokens::SOP1DB => {
-                defmt::info!("Received SOP'Debug {}", msg_type);
-                SopTarget::SOP1DB
-            }
-            registers::fifo::rx_tokens::SOP2DB => {
-                defmt::info!("Received SOP''Debug {}", msg_type);
-                SopTarget::SOP2DB
-            }
-            _ => panic!("Unknown packet received {:?}", msg_type),
-        };
 
         // Now read the rest of the message from the fifo
         let num_objects = header.num_objects();
@@ -599,6 +576,30 @@ impl<T: WriteRead + Write> Fusb302<T> {
         self.i2c_bus
             .write_read(DEVICE_SLAVE_ADDR, &reg_addr, &mut raw_objects)
             .map_err(|err| Error::IOReadError(err))?;
+
+        let sop_target = match token_and_header[0] & registers::fifo::rx_tokens::MASK {
+            registers::fifo::rx_tokens::SOP => {
+                defmt::info!("Received SOP {}, {:x}", msg_type, raw_objects);
+                SopTarget::SOP
+            }
+            registers::fifo::rx_tokens::SOP1 => {
+                defmt::info!("Received SOP' {}, {:x}", msg_type, raw_objects);
+                SopTarget::SOP1
+            }
+            registers::fifo::rx_tokens::SOP2 => {
+                defmt::info!("Received SOP'' {}, {:x}", msg_type, raw_objects);
+                SopTarget::SOP2
+            }
+            registers::fifo::rx_tokens::SOP1DB => {
+                defmt::info!("Received SOP'Debug {}, {:x}", msg_type, raw_objects);
+                SopTarget::SOP1DB
+            }
+            registers::fifo::rx_tokens::SOP2DB => {
+                defmt::info!("Received SOP''Debug {}, {:x}", msg_type, raw_objects);
+                SopTarget::SOP2DB
+            }
+            _ => panic!("Unknown packet received {:?}, {:?}", msg_type, raw_objects),
+        };
 
         Ok((sop_target, header, raw_objects))
     }
