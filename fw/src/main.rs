@@ -94,7 +94,7 @@ mod app {
     // Resources shared between tasks
     #[shared]
     struct Shared {
-        fsm_spawn_handle: Option<run_state_machine::SpawnHandle>,
+        usb_pd_fsm_spawn_handle: Option<usb_pd_fsm_task::SpawnHandle>,
         usb_serial: UsbSerial,
         state_machine: UsbFsm,
     }
@@ -163,15 +163,15 @@ mod app {
             .max_power(500)
             .build();
 
-        run_state_machine::spawn().unwrap();
-        usb_task::spawn().unwrap();
+        usb_pd_fsm_task::spawn().unwrap();
+        usb_device_task::spawn().unwrap();
         led_task::spawn_after(1.secs()).unwrap();
 
         let command_handler = cmd_handler::CommandHandler::new();
 
         (
             Shared {
-                fsm_spawn_handle: None,
+                usb_pd_fsm_spawn_handle: None,
                 usb_serial,
                 state_machine,
             },
@@ -187,34 +187,34 @@ mod app {
     }
 
     #[idle]
-    fn idle(_: idle::Context) -> ! {
+    fn idle_task(_: idle_task::Context) -> ! {
         loop {
             cortex_m::asm::wfi();
         }
     }
 
     #[task(local = [usb_device], shared = [usb_serial], priority = 3)]
-    fn usb_task(cx: usb_task::Context) {
-        let usb_task::LocalResources { usb_device } = cx.local;
-        let usb_task::SharedResources { mut usb_serial } = cx.shared;
+    fn usb_device_task(cx: usb_device_task::Context) {
+        let usb_device_task::LocalResources { usb_device } = cx.local;
+        let usb_device_task::SharedResources { mut usb_serial } = cx.shared;
 
         usb_serial.lock(|usb_serial| {
             if usb_device.poll(&mut [usb_serial]) {
                 // Make sure the message handler will process the event
-                msg_handler::spawn().ok();
+                msg_handler_task::spawn().ok();
             }
         });
 
-        usb_task::spawn_after(2.millis()).unwrap();
+        usb_device_task::spawn_after(2.millis()).unwrap();
     }
 
     #[task(shared = [usb_serial, state_machine], local = [command_handler], priority = 2)]
-    fn msg_handler(cx: msg_handler::Context) {
-        let msg_handler::SharedResources {
+    fn msg_handler_task(cx: msg_handler_task::Context) {
+        let msg_handler_task::SharedResources {
             mut usb_serial,
             mut state_machine,
         } = cx.shared;
-        let msg_handler::LocalResources { command_handler } = cx.local;
+        let msg_handler_task::LocalResources { command_handler } = cx.local;
 
         let mut buffer = [0u8; 128];
         match usb_serial.lock(|usb_serial| usb_serial.read(&mut buffer)) {
@@ -243,11 +243,11 @@ mod app {
         }
     }
 
-    #[task(local = [gpiote], shared = [fsm_spawn_handle], binds = GPIOTE, priority = 1)]
-    fn gpiote_irq(cx: gpiote_irq::Context) {
+    #[task(local = [gpiote], shared = [usb_pd_fsm_spawn_handle], binds = GPIOTE, priority = 1)]
+    fn gpiote_irq_task(cx: gpiote_irq_task::Context) {
         // We need to handle the IRQ here and let the state machine now it needs to run
         let gpiote = cx.local.gpiote;
-        let mut spawn_handle = cx.shared.fsm_spawn_handle;
+        let mut spawn_handle = cx.shared.usb_pd_fsm_spawn_handle;
 
         if gpiote.channel0().is_event_triggered() {
             defmt::info!("IRQ: FUSB302");
@@ -258,24 +258,24 @@ mod app {
                 }
             });
 
-            run_state_machine::spawn().ok();
+            usb_pd_fsm_task::spawn().ok();
             gpiote.channel0().reset_events();
         }
     }
 
-    #[task(local = [timer], shared = [fsm_spawn_handle, state_machine], capacity = 1, priority = 1)]
-    fn run_state_machine(cx: run_state_machine::Context) {
-        let run_state_machine::LocalResources { timer } = cx.local;
-        let run_state_machine::SharedResources {
-            mut fsm_spawn_handle,
+    #[task(local = [timer], shared = [usb_pd_fsm_spawn_handle, state_machine], capacity = 1, priority = 1)]
+    fn usb_pd_fsm_task(cx: usb_pd_fsm_task::Context) {
+        let usb_pd_fsm_task::LocalResources { timer } = cx.local;
+        let usb_pd_fsm_task::SharedResources {
+            mut usb_pd_fsm_spawn_handle,
             mut state_machine,
         } = cx.shared;
 
         state_machine.lock(|m| m.run(timer).unwrap());
 
         // Spawn again after 4 ms
-        let handle = run_state_machine::spawn_after(4.millis()).unwrap();
-        fsm_spawn_handle.lock(|hdl| hdl.replace(handle));
+        let handle = usb_pd_fsm_task::spawn_after(4.millis()).unwrap();
+        usb_pd_fsm_spawn_handle.lock(|hdl| hdl.replace(handle));
     }
 
     #[task(local = [led], priority = 1)]
