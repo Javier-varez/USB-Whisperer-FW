@@ -4,7 +4,7 @@
 mod cmd_handler;
 mod fusb302;
 mod system_timer;
-mod usb_fsm;
+mod usb_pd_fsm;
 
 use defmt_rtt as _; // global logger
 
@@ -50,7 +50,7 @@ pub fn exit() -> ! {
 
 #[rtic::app(device = nrf52840_hal::pac, dispatchers = [NFCT, USBD, TIMER0])]
 mod app {
-    use super::{cmd_handler, fusb302, usb_fsm};
+    use super::{cmd_handler, fusb302, usb_pd_fsm};
     use nrf52840_hal::{self as hal, gpiote::Gpiote};
     use systick_monotonic::*;
 
@@ -79,7 +79,7 @@ mod app {
     pub type UsbSerial = SerialPort<'static, hal::usbd::Usbd<hal::usbd::UsbPeripheral<'static>>>;
     type UsbDevice =
         usb_device::device::UsbDevice<'static, hal::usbd::Usbd<hal::usbd::UsbPeripheral<'static>>>;
-    type UsbFsm = usb_fsm::UsbFsm<Twim<TWIM0>, Pin<Input<PullUp>>, Pin<Output<PushPull>>>;
+    type UsbFsm = usb_pd_fsm::UsbPdFsm<Twim<TWIM0>, Pin<Input<PullUp>>, Pin<Output<PushPull>>>;
 
     // Local resources to specific tasks (cannot be shared)
     #[local]
@@ -145,7 +145,7 @@ mod app {
             .enable_interrupt();
 
         let fusb302 = fusb302::Fusb302::new(twim).unwrap();
-        let state_machine = usb_fsm::UsbFsm::new(fusb302, irq_pin, vbus_pin).unwrap();
+        let state_machine = usb_pd_fsm::UsbPdFsm::new(fusb302, irq_pin, vbus_pin).unwrap();
 
         let usb_peripheral = hal::usbd::UsbPeripheral::new(peripherals.USBD, &clocks);
         let usb_bus = hal::usbd::Usbd::new(usb_peripheral);

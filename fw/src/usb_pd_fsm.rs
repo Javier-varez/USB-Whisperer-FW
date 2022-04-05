@@ -54,7 +54,7 @@ impl<T: WriteRead + Write> From<fusb302::Error<T>> for Error<T> {
     }
 }
 
-pub struct UsbFsm<T, U, X>
+pub struct UsbPdFsm<T, U, X>
 where
     T: WriteRead + Write,
     U: InputPin,
@@ -69,7 +69,7 @@ where
     uart_autoconf: bool,
 }
 
-impl<T, U, X> UsbFsm<T, U, X>
+impl<T, U, X> UsbPdFsm<T, U, X>
 where
     T: WriteRead + Write,
     U: InputPin,
