@@ -3,10 +3,9 @@
 
 mod cmd_handler;
 mod fusb302;
+mod logger;
 mod system_timer;
 mod usb_pd_fsm;
-
-use defmt_rtt as _; // global logger
 
 use core::panic::PanicInfo;
 
@@ -50,7 +49,7 @@ pub fn exit() -> ! {
 
 #[rtic::app(device = nrf52840_hal::pac, dispatchers = [NFCT, USBD, TIMER0])]
 mod app {
-    use super::{cmd_handler, fusb302, usb_pd_fsm};
+    use super::{cmd_handler, fusb302, logger, usb_pd_fsm};
     use nrf52840_hal::{self as hal, gpiote::Gpiote};
     use systick_monotonic::*;
 
@@ -68,6 +67,8 @@ mod app {
     use usb_whisperer_lib::message::Message;
 
     use embedded_hal::digital::v2::{OutputPin, StatefulOutputPin};
+
+    use heapless::spsc::{Consumer, Queue};
 
     defmt::timestamp!("{=u64:us}", { monotonics::now().ticks() * 1000 });
 
@@ -89,20 +90,22 @@ mod app {
         usb_device: UsbDevice,
         command_handler: cmd_handler::CommandHandler,
         led: Pin<Output<PushPull>>,
+        usb_logger_consumer: Consumer<'static, u8, { logger::BUF_SIZE }>,
     }
 
     // Resources shared between tasks
     #[shared]
     struct Shared {
         usb_pd_fsm_spawn_handle: Option<usb_pd_fsm_task::SpawnHandle>,
-        usb_serial: UsbSerial,
+        usb_serial1: UsbSerial,
+        usb_serial2: UsbSerial,
         state_machine: UsbFsm,
     }
 
     #[monotonic(binds = SysTick, default = true, priority = 7)]
     type SystickMonotonic = Systick<1000>; // 1000 Hz / 1 ms granularity
 
-    #[init(local = [clocks: Option<Clocks> = None, usb_bus: Option<UsbBus> = None])]
+    #[init(local = [clocks: Option<Clocks> = None, usb_bus: Option<UsbBus> = None, logger_queue: Option<Queue<u8, {logger::BUF_SIZE}>> = None])]
     fn init(cx: init::Context) -> (Shared, Local, init::Monotonics) {
         let cm_peripherals = cx.core;
         let peripherals = cx.device;
@@ -152,7 +155,8 @@ mod app {
         cx.local.usb_bus.replace(usb_bus);
         let usb_bus = cx.local.usb_bus.as_ref().unwrap();
 
-        let usb_serial = SerialPort::new(&usb_bus);
+        let usb_serial1 = SerialPort::new(&usb_bus);
+        let usb_serial2 = SerialPort::new(&usb_bus);
 
         // TODO(javier-varez): Modify VID-PID pair. Currently using a test set from pid.codes
         let usb_device = UsbDeviceBuilder::new(&usb_bus, UsbVidPid(0x1209, 0x0001))
@@ -163,6 +167,10 @@ mod app {
             .max_power(500)
             .build();
 
+        cx.local.logger_queue.replace(Queue::new());
+        let (producer, consumer) = cx.local.logger_queue.as_mut().unwrap().split();
+        unsafe { logger::register_usb_queue(producer) };
+
         usb_pd_fsm_task::spawn().unwrap();
         usb_device_task::spawn().unwrap();
         led_task::spawn_after(1.secs()).unwrap();
@@ -172,7 +180,8 @@ mod app {
         (
             Shared {
                 usb_pd_fsm_spawn_handle: None,
-                usb_serial,
+                usb_serial1,
+                usb_serial2,
                 state_machine,
             },
             Local {
@@ -181,6 +190,7 @@ mod app {
                 usb_device,
                 command_handler,
                 led,
+                usb_logger_consumer: consumer,
             },
             init::Monotonics(mono),
         )
@@ -193,38 +203,51 @@ mod app {
         }
     }
 
-    #[task(local = [usb_device], shared = [usb_serial], priority = 3)]
+    #[task(local = [usb_device, usb_logger_consumer], shared = [usb_serial1, usb_serial2], priority = 3)]
     fn usb_device_task(cx: usb_device_task::Context) {
-        let usb_device_task::LocalResources { usb_device } = cx.local;
-        let usb_device_task::SharedResources { mut usb_serial } = cx.shared;
+        let usb_device_task::LocalResources {
+            usb_device,
+            usb_logger_consumer,
+        } = cx.local;
+        let usb_device_task::SharedResources {
+            mut usb_serial1,
+            mut usb_serial2,
+        } = cx.shared;
 
-        usb_serial.lock(|usb_serial| {
-            if usb_device.poll(&mut [usb_serial]) {
-                // Make sure the message handler will process the event
-                msg_handler_task::spawn().ok();
+        usb_serial2.lock(|usb_serial2| {
+            // Pull data out of the consumer and into usb
+            while let Some(val) = usb_logger_consumer.dequeue() {
+                usb_serial2.write(&[val]).unwrap();
             }
+
+            usb_serial1.lock(|usb_serial1| {
+                if usb_device.poll(&mut [usb_serial1, usb_serial2]) {
+                    // Make sure the message handler will process the event
+                    msg_handler_task::spawn().ok();
+                }
+            });
         });
 
         usb_device_task::spawn_after(2.millis()).unwrap();
     }
 
-    #[task(shared = [usb_serial, state_machine], local = [command_handler], priority = 2)]
+    #[task(shared = [usb_serial1, state_machine], local = [command_handler], priority = 2)]
     fn msg_handler_task(cx: msg_handler_task::Context) {
         let msg_handler_task::SharedResources {
-            mut usb_serial,
+            mut usb_serial1,
             mut state_machine,
         } = cx.shared;
         let msg_handler_task::LocalResources { command_handler } = cx.local;
 
         let mut buffer = [0u8; 128];
-        match usb_serial.lock(|usb_serial| usb_serial.read(&mut buffer)) {
+        match usb_serial1.lock(|usb_serial| usb_serial.read(&mut buffer)) {
             Ok(size) => match command_handler.deserialize_message(&mut buffer[..size]) {
                 Ok(message) => {
                     let mut send_message = |message: &Message| {
                         let message_buffer = command_handler
                             .serialize_message(message, &mut buffer)
                             .unwrap();
-                        usb_serial
+                        usb_serial1
                             .lock(|usb_serial| usb_serial.write(message_buffer))
                             .unwrap()
                     };

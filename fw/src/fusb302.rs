@@ -551,7 +551,7 @@ impl<T: WriteRead + Write> Fusb302<T> {
         Ok((status1 & registers::status1::RX_EMPTY) != 0)
     }
 
-    pub fn receive_message(&mut self) -> Result<(SopTarget, MessageHeader, Vec<u8, 28>), Error<T>> {
+    pub fn receive_message(&mut self) -> Result<(SopTarget, MessageHeader, Vec<u8, 32>), Error<T>> {
         // Receive token and header
         let reg_addr = [registers::fifo::ADDR];
         let mut token_and_header = [0; 3];
@@ -569,7 +569,7 @@ impl<T: WriteRead + Write> Fusb302<T> {
         let num_objects = header.num_objects();
         let num_bytes = num_objects * core::mem::size_of::<u32>();
 
-        let mut raw_objects: Vec<u8, 28> = Vec::new();
+        let mut raw_objects: Vec<u8, 32> = Vec::new();
         // Add 4 for the CRC
         raw_objects.resize(num_bytes + 4, 0).unwrap(); // Should always be < 7 by design
 

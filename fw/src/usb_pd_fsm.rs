@@ -427,10 +427,13 @@ where
                     .send_message(SopTarget::SOP2DB, &vdm_message)?;
                 Ok(message::Message::Ack)
             }
-            message::Message::RequestState => Ok(message::Message::ReportState(
-                self.current_state_to_global_state(),
-                self.uart_autoconf,
-            )),
+            message::Message::RequestState => {
+                defmt::info!("Requested global state");
+                Ok(message::Message::ReportState(
+                    self.current_state_to_global_state(),
+                    self.uart_autoconf,
+                ))
+            }
             message::Message::SetAutoConfigureUart(enable) => {
                 self.uart_autoconf = *enable;
                 Ok(message::Message::Ack)
